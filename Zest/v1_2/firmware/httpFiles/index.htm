@@ -1,0 +1,277 @@
+<!doctype html>
+<html>
+	<head>
+		<meta charset="utf-8">
+        <meta name="apple-mobile-web-app-capable" content="yes" />
+        <meta name="mobile-web-app-capable" content="yes" />
+
+        <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+        <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+        <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+        <link rel="manifest" href="/site.webmanifest">
+        <link rel="mask-icon" href="/safari-pinned-tab.svg" color="#5bbad5">
+        <meta name="apple-mobile-web-app-title" content="Pomelo">
+        <meta name="application-name" content="Pomelo">
+        <meta name="msapplication-TileColor" content="#da532c">
+        <meta name="theme-color" content="#ffffff">
+        
+        <title>Pomelo Gamma Spectrometer</title>
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+        body {
+            padding: 0;
+            margin: 0;
+        }
+        .button {
+          background-color: #04AA6D;
+          border: none;
+          color: white;
+          padding: 10px;
+          text-align: center;
+          text-decoration: none;
+          display: inline-block;
+          font-size: 16px;
+          margin: 4px 2px;
+          cursor: pointer;
+          border-radius: 8px;
+        }
+        .uplot {
+            touch-action: pan-x pan-y;
+        }
+        </style>
+        <link rel="stylesheet" href="./uPlot.min.css">
+		<script src="./uPlot.iife.min.js"></script>
+		<script>
+			function touchZoomPlugin(opts) {
+				function init(u, opts, data) {
+					let over = u.over;
+					let rect, oxRange, xVal;
+					let fr = {x: 0, dx: 0};
+					let to = {x: 0, dx: 0};
+
+					function storePos(t, e) {
+						let ts = e.touches;
+
+						let t0 = ts[0];
+						let t0x = t0.clientX - rect.left;
+
+						if (ts.length == 1) {
+							t.x = t0x;
+							t.dx = 1;
+						}
+						else {
+							let t1 = e.touches[1];
+							let t1x = t1.clientX - rect.left;
+
+							let xMin = Math.min(t0x, t1x);
+							let xMax = Math.max(t0x, t1x);
+
+							// midpts
+							t.x = (xMin+xMax)/2;
+
+							t.dx = xMax - xMin;
+						}
+					}
+
+					let rafPending = false;
+
+					function zoom() {
+						rafPending = false;
+
+						let left = to.x;
+
+						// uniform x/y scaling
+						let xFactor = fr.dx / to.dx;
+
+						let leftPct = left/rect.width;
+
+						let nxRange = oxRange * xFactor;
+						let nxMin = xVal - leftPct * nxRange;
+						let nxMax = nxMin + nxRange;
+
+						u.batch(() => {
+							u.setScale("x", {
+								min: nxMin,
+								max: nxMax,
+							});
+						});
+					}
+
+					function touchmove(e) {
+						storePos(to, e);
+
+						if (!rafPending) {
+							rafPending = true;
+							requestAnimationFrame(zoom);
+						}
+					}
+
+					over.addEventListener("touchstart", function(e) {
+						rect = over.getBoundingClientRect();
+
+						storePos(fr, e);
+
+						oxRange = u.scales.x.max - u.scales.x.min;
+						let left = fr.x;
+
+						xVal = u.posToVal(left, "x");
+
+						document.addEventListener("touchmove", touchmove, {passive: true});
+					});
+
+					over.addEventListener("touchend", function(e) {
+						document.removeEventListener("touchmove", touchmove, {passive: true});
+					});
+				}
+
+				return {
+					hooks: {
+						init
+					}
+				};
+			}
+
+			function getSize() {
+				return {
+					width: window.innerWidth*0.95,
+					height: window.innerHeight*0.7,
+				}
+			}
+            
+            function startSpectrum()
+            {
+                // Default energy and spectrum
+                let energy = Array.from({length: 1024}, (e, i)=> (%C2%)*i*i + (%C1%)*i + (%C0%));
+                let histData = Array.from({length: 1024}, (e, i)=> 0);
+
+                let data = [
+                    energy,
+                    histData,
+                ];
+
+                const paths = uPlot.paths.stepped({align:  1});
+
+                const optsLin = {
+                    ...getSize(),
+					plugins: [
+						touchZoomPlugin()
+					],
+                    scales: {
+                        x: {
+                            time: false,
+                        },
+                    },
+                    series: [
+                        {
+                            label: "Energy [keV]",
+                        },
+                        {
+                            label: "Counts",
+                            stroke: "red",
+                            fill: "rgba(255,0,0,0.1)",
+                            paths
+                        },
+                    ],
+                };
+
+                const optsLog = {
+                    ...getSize(),
+					plugins: [
+						touchZoomPlugin()
+					],
+                    scales: {
+                        x: {
+                            time: false,
+                        },
+                        y: {
+                            distr: 3,
+                        },
+                    },
+                    series: [
+                        {
+                            label: "Energy [keV]",
+                        },
+                        {
+                            label: "Counts",
+                            stroke: "red",
+                            fill: "rgba(255,0,0,0.1)",
+                            paths
+                        },
+                    ],
+                };
+
+
+                let plot = new uPlot(optsLin, data, document.getElementById("canvas"));
+
+                window.addEventListener("resize", e => {
+                    plot.setSize(getSize());
+                });
+                
+                document.addEventListener('DOMContentLoaded', function () {
+                    document.querySelector('#logScale').addEventListener('change', function () {
+                        plot.destroy();
+                        if (document.getElementById("logScale").checked)
+                        {
+                            plot = new uPlot(optsLog, data, document.getElementById("canvas"));
+                            plot.setSize(getSize());
+                        }
+                        else
+                        {
+                            plot = new uPlot(optsLin, data, document.getElementById("canvas"));
+                            plot.setSize(getSize());
+                        }
+                    });
+                });
+                
+                setInterval(function(){
+                    var xhttp = new XMLHttpRequest();
+                    xhttp.onreadystatechange = function() {
+                        if (this.readyState == 4 && this.status == 200) {
+                            let obj = JSON.parse(this.responseText);
+                            data = [
+                                energy,
+                                obj.histo,
+                            ];
+                            plot.setData(data, false);
+                            plot.redraw();
+                            document.getElementById("counts").innerHTML = "Counts: " + obj.counts;
+                            document.getElementById("time").innerHTML = "Time: " + obj.time + " s";
+                    }};
+                    xhttp.open("GET", "hist.json", true);
+                    xhttp.setRequestHeader('Cache-Control', 'no-cache');
+                    xhttp.send();
+                }, 1000);
+            }
+
+            function startRun()
+            {
+                var xhr = new XMLHttpRequest();
+                xhr.open("GET", "/?restart=1", true);
+                xhr.send();
+            }
+            function stopRun()
+            {
+                var xhr = new XMLHttpRequest();
+                xhr.open("GET", "/?stop=1", true);
+                xhr.send();
+            }
+          </script>
+	</head>
+	<body>
+    <button class="button" onclick="startRun()">(Re)start run</button>
+    <button class="button" onclick="stopRun()">Stop run</button>
+    <a href="./spectrum.n42">Download spectrum</a> 
+    <div id="object_draw">
+        <h2 id="counts">Counts: 0</h2>
+        <h2 id="time">Time: 0 s</h2>
+        <input type="checkbox" id="logScale"> Log<br>
+        <div id="canvas"></div>
+        <script>startSpectrum();</script>
+    </div>
+    <br><br>
+    <a href="./wifi.htm">WiFi settings</a> 
+    <br>
+    <a href="./time.htm">Set time</a> 
+    </div>
+	</body>
+</html>
