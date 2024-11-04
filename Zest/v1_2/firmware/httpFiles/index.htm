@@ -141,12 +141,17 @@
             function startSpectrum()
             {
                 // Default energy and spectrum
-                let energy = Array.from({length: 1024}, (e, i)=> (%C2%)*i*i + (%C1%)*i + (%C0%));
+				let e0 = %C0%;
+				let e1 = %C1%;
+				let e2 = %C2%;
+				let delta = e1*e1-4*e0*e2;
+				let x = Math.ceil((-e1+Math.sqrt(delta))/(2*e2));
+                let energy = Array.from({length: 1024}, (e, i)=> e2*i*i + e1*i + e0);
                 let histData = Array.from({length: 1024}, (e, i)=> 0);
 
                 let data = [
-                    energy,
-                    histData,
+                    energy.slice(x, 1024),
+                    histData.slice(x, 1024),
                 ];
 
                 const paths = uPlot.paths.stepped({align:  1});
@@ -229,8 +234,8 @@
                         if (this.readyState == 4 && this.status == 200) {
                             let obj = JSON.parse(this.responseText);
                             data = [
-                                energy,
-                                obj.histo,
+                                energy.slice(x, 1024),
+                                obj.histo.slice(x, 1024),
                             ];
                             plot.setData(data, false);
                             plot.redraw();

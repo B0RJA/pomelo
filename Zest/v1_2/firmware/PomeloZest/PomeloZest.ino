@@ -2,58 +2,44 @@
 
 #include "driver/rtc_io.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
+#include "driver/ledc.h"
+#include "esp32-hal-ledc.h"
+
+#include "soc/soc.h"
+#include "esp_intr_alloc.h"
+
+#include "hal/pmu_types.h"
+#include "soc/pmu_icg_mapping.h"
+#include "soc/pmu_struct.h"
+
+#include "hal/uart_ll.h"
+#include "soc/interrupts.h"
+
 #include <ESP32Time.h>
 #include <Preferences.h>
 
-#include <WiFi.h>
 #include <ArduinoJson.h>
-
-#include <AsyncTCP.h>
-#include "ESPAsyncWebServer.h"
 
 #include <Arduino.h>
 #include <U8g2lib.h>
 
-#include "FS.h"
-#include "SD.h"
-#include "SPI.h"
-
-#include <Adafruit_GPS.h>
-
-#include "qrcode.h"
-#include "1euroFilter.h"
 #include <EasyButton.h>
 
-// Data file with all web code
-#include "uPlot.h"
+#include "1euroFilter.h"
+
+#include <WiFi.h>
+#include <ESPmDNS.h>
+
+
+OneEuroFilter *cpm_euroFilter;
+OneEuroFilter *usv_euroFilter;
 
 Preferences preferences;
 String wifi_ssid, wifi_pass;
-IPAddress wifi_IP;
-bool wifiOk, wifiAP;
-uint8_t baseMac[6];
-
 
 U8G2_ST7565_NHD_C12832_F_4W_SW_SPI u8g2(U8G2_R0, /* clock=*/ 10, /* data=*/ 0, /* cs=*/ 11, /* dc=*/ 1, /* reset=*/ 22);
 
-AsyncWebServer webServer(80);
-
-Adafruit_GPS GPS(&Serial0);
-
-//WiFiServer server(23);
-//WiFiClient client;
-
-#define DISPLAY_MAIN    1
-#define DISPLAY_CPM     2
-#define DISPLAY_USV     3
-#define DISPLAY_WIFI    4
-#define DISPLAY_SP      5
-#define DISPLAY_POWER   6
-#define DISPLAY_LOG_GPS 7
-#define DISPLAY_LOG     8
-#define DISPLAY_WIFI_QR 9
-
-#define FILTER_LEN      50
 
 // Pin definitions
 #define BUT1_A          6
@@ -66,14 +52,7 @@ Adafruit_GPS GPS(&Serial0);
 #define BACKLIGHT       15
 #define BUZZER          23
 
-#define LOGFILE_INTERVAL_S 60
 #define HIST_LEN           60
-
-#define DEBOUNCE_MILLIS 150
-
-const char n42_file[] PROGMEM = "<?xml version=\"1.0\"?><?xml-model href=\"http://physics.nist.gov/N42/2011/schematron/n42.sch\" type=\"application/xml\" schematypens=\"http://purl.oclc.org/dsdl/schematron\"?><RadInstrumentData xmlns=\"http://physics.nist.gov/N42/2011/N42\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"http://physics.nist.gov/N42/2011/N42 http://physics.nist.gov/N42/2011/n42.xsd\" n42DocUUID=\"d72b7fa7-4a20-43d4-b1b2-7e3b8c6620c1\"><RadInstrumentInformation id=\"RadInstrumentInformation-1\"><RadInstrumentManufacturerName>Pomelo</RadInstrumentManufacturerName><RadInstrumentModelName>Core</RadInstrumentModelName><RadInstrumentClassCode>Radionuclide Identifier</RadInstrumentClassCode><RadInstrumentVersion><RadInstrumentComponentName>Hardware</RadInstrumentComponentName><RadInstrumentComponentVersion>1.2</RadInstrumentComponentVersion></RadInstrumentVersion></RadInstrumentInformation><RadDetectorInformation id=\"RadDetectorInformation-1\"><RadDetectorCategoryCode>Gamma</RadDetectorCategoryCode><RadDetectorKindCode>CsI(Tl)</RadDetectorKindCode></RadDetectorInformation><EnergyCalibration id=\"EnergyCalibration-1\"><CoefficientValues>%C0% %C1% %C2%</CoefficientValues></EnergyCalibration> <RadMeasurement id=\"RadMeasurement-1\"><MeasurementClassCode>Foreground</MeasurementClassCode><StartDateTime>%DATETIME%</StartDateTime><RealTimeDuration>PT%DURATION%S</RealTimeDuration><Spectrum id=\"RadMeasurement-1Spectrum-1\" radDetectorInformationReference=\"RadDetectorInformation-1\" energyCalibrationReference=\"EnergyCalibration-1\"> <LiveTimeDuration>PT%LIVE%S</LiveTimeDuration><ChannelData compressionCode=\"None\">%SPECTRUM%</ChannelData> </Spectrum></RadMeasurement>	</RadInstrumentData>";
-const char hist_json[] PROGMEM = "{\"counts\":%COUNTS%,\"time\":%TIME%,\"histo\":[%DATA%]}";
-String jsonData;
 
 
 EasyButton buttonA(BUT1_A, 35, false, false);
@@ -83,93 +62,594 @@ EasyButton buttonC(BUT3_C, 35, false, false);
 
 ESP32Time rtc;
 
-bool sdOk, fileLogging;
-File logFile;
-uint32_t logFileNumber;
-uint32_t logFileEntry;
-uint32_t tLog;
-char logDir[80];
+volatile uint32_t tCanSleep;
 
-uint32_t bufHistory[HIST_LEN + 1];
+float bufHistoryCpm[HIST_LEN + 1];
+float bufHistoryUsv[HIST_LEN + 1];
 
-uint32_t tDisplay, tNow, tLastPulse;
+float serviceCpm, serviceUsv, serviceCpmRaw, serviceUsvRaw;
+bool serviceUartPulse;
+bool serviceRunning;
+bool serviceSkipMeasurement;
+
+
+uint32_t tNow, tLightOff, tService, tServiceWait;
 char buf[24576];
 char printBuf[80];
 
-uint32_t hist[1024];
-uint32_t histCounts;
-uint32_t histTime;
-float histEcal[3];
-float histTemp;
+uint32_t serviceHist[1024];
+uint32_t serviceHistCounts;
+uint32_t serviceHistTime;
+float serviceHistEcal[3];
 
-volatile bool pressed_BUT1_A, pressed_BUT2_B, pressed_BUT3_C;
-volatile bool pressed_BUT1_A_long, pressed_BUT2_B_long, pressed_BUT3_C_long;
+float serviceCoreTemp;
+bool serviceCoreRunning;
+char serviceCoreSN[64];
+
+bool startDaq;
+
+#define BUTTON_1                0
+#define BUTTON_2                1
+#define BUTTON_3                2
+#define BUTTON_1_LONG           3
+#define BUTTON_2_LONG           4
+#define BUTTON_3_LONG           5
+
+uint8_t pressedButtonFlags;
 
 
-RTC_DATA_ATTR bool core_shutdown;
-RTC_DATA_ATTR bool spectrumLog;
-RTC_DATA_ATTR uint8_t displayMode;
+RTC_DATA_ATTR bool backlightEnabled;
+RTC_DATA_ATTR int8_t backlightSeconds;
+RTC_DATA_ATTR uint8_t backlightIntensity;
+
+
+#define UART_BUFFER_LEN 16384
+volatile uint16_t rxBufHead, rxBufTail;
+volatile uint8_t rxBuf[UART_BUFFER_LEN];
+
+hw_timer_t *Timer0 = NULL;
+volatile uint16_t beep_ms;
+
+#define SERVICE_CONFIG          0
+#define SERVICE_SYSTEM          1
+#define SERVICE_DOSIMETRY       2
+#define SERVICE_SPECTROSCOPY    3
+#define SERVICE_DATASTREAM      4
+#define SERVICE_TICK            5
+
+volatile uint8_t serviceList[8];
+uint8_t serviceUpdateFlags;
+
+
+bool wifi_connected, wifi_AP, wifi_reconnecting, wifi_mdns;
+String wifi_mdns_name;
+IPAddress wifi_IP;
+uint8_t wifi_MAC[6];
+uint32_t wifi_tReconnect;
 
 
 
-float euroFilterFreq, euroFilterMinCutoff, euroFilterBeta;
-OneEuroFilter *euroFilter;
+// Fix for [E][AsyncTCP.cpp:1486] begin(): bind error: -8
+// ---------------------------------------------------------------------------------------------------
+// https://github.com/esp8266/Arduino/tree/master/doc/faq#how-to-clear-tcp-pcbs-in-time-wait-state-
+struct tcp_pcb;
+extern struct tcp_pcb* tcp_tw_pcbs;
+extern "C" void tcp_abort (struct tcp_pcb* pcb);
 
-void usbWrite(char* buf)
-{
-  if (Serial) Serial.write(buf);
+void tcpCleanup (void) {
+  while (tcp_tw_pcbs)
+    tcp_abort(tcp_tw_pcbs);
 }
+// ---------------------------------------------------------------------------------------------------
 
-void IRAM_ATTR isr_BUT1_A()
-{
-  buttonA.read();
-}
 
-void IRAM_ATTR isr_BUT2_B()
+typedef struct zestApp
 {
-  buttonB.read();
-}
+  struct zestApp *parent;
+  char name[64];
+  char icon[16];
+  bool (*updateUI)(uint8_t buttonFlags);         // Returns false if app quit, so we need to refresh UI with next app
+  bool (*updateService)(uint8_t serviceFlags);   // Returns false if it can't handle more data. Only valid for SERVICE_DATASTREAM
+  int32_t (*maySleepFor)();
+} zestApp_t;
 
-void IRAM_ATTR isr_BUT3_C()
+
+zestApp_t *runningApp;
+
+
+void noSleepUntil(uint32_t ms)
 {
-  buttonC.read();
+  if (tCanSleep < ms) tCanSleep = ms;
 }
 
 void onButtonAPressed()
 {
-  pressed_BUT1_A = true;
+  pressedButtonFlags |= (1 << BUTTON_1);
 }
 
 void onButtonBPressed()
 {
-  pressed_BUT2_B = true;
+  pressedButtonFlags |= (1 << BUTTON_2);
 }
 
 void onButtonCPressed()
 {
-  pressed_BUT3_C = true;
+  pressedButtonFlags |= (1 << BUTTON_3);
 }
 
 void onButtonALongPressed()
 {
-  pressed_BUT1_A_long = true;
+  pressedButtonFlags |= (1 << BUTTON_1_LONG);
 }
 
 void onButtonBLongPressed()
 {
-  pressed_BUT2_B_long = true;
+  pressedButtonFlags |= (1 << BUTTON_2_LONG);
 }
 
 void onButtonCLongPressed()
 {
-  pressed_BUT3_C_long = true;
+  pressedButtonFlags |= (1 << BUTTON_3_LONG);
 }
 
+// Check if TX fifo has space!
+void coreCommand(char *cmd)
+{
+  static uint8_t i, n;
+  while (*cmd != 0)
+  {
+    while (uart_ll_get_txfifo_len(&UART1) == 0) ;
+    uart_ll_write_txfifo(&UART1, (const uint8_t*)cmd, 1);
+    n = 1;
+    if (*cmd == '\n') n = 6;
+    
+    // This might take a while, so keep checking buttons for activity
+    for (i = 0; i < n; i++)
+    {
+      if (buttonA.read()) noSleepUntil(tNow + 1000);
+      if (buttonB.read()) noSleepUntil(tNow + 1000);
+      if (buttonC.read()) noSleepUntil(tNow + 1000);
+      delay(10);
+    }
+    cmd++;
+  }
+  noSleepUntil(millis() + 50);
+}
+
+static void IRAM_ATTR timer0_ISR()
+{
+  ledcWrite(BUZZER, 0);
+  timerStop(Timer0);
+}
+
+void zestBeep(uint16_t ms)
+{
+  ledcWrite(BUZZER, 128);
+  timerStop(Timer0);
+  timerWrite(Timer0, 0);
+  timerStart(Timer0);
+  timerAlarm(Timer0, ms*1000, false, 0);
+  noSleepUntil(tNow + ms + 10);
+}
+
+
+static void IRAM_ATTR coreUartIsr(void *arg)
+{
+  static uint8_t data;
+
+  while (uart_ll_get_rxfifo_len(&UART1) != 0)
+  {
+    uart_ll_read_rxfifo(&UART1, &data, 1);
+    if (serviceList[SERVICE_DATASTREAM] != 0)
+    {
+      // Special case if app wants all data
+      rxBuf[rxBufHead] = data;
+      rxBufHead = (rxBufHead + 1) % UART_BUFFER_LEN;
+    }
+    else
+    {
+      if (data == 0xAA)
+      {
+        zestBeep(beep_ms);
+      }
+      else if ((data < 128) && (rxBufHead != rxBufTail))
+      {
+        rxBuf[rxBufHead] = data;
+        rxBufHead = (rxBufHead + 1) % UART_BUFFER_LEN;
+      }
+    }
+  }
+  uart_ll_clr_intsts_mask(&UART1, UART_INTR_RXFIFO_FULL);
+}
+
+// Remove dependency on uart driver. Ugh, not trivial
+void serialConfig()
+{
+  const uart_config_t uart_config = {
+      .baud_rate = 921600,
+      .data_bits = UART_DATA_8_BITS,
+      .parity = UART_PARITY_DISABLE,
+      .stop_bits = UART_STOP_BITS_1,
+      .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+      .source_clk = UART_SCLK_DEFAULT
+  };
+  uart_param_config(UART_NUM_1, &uart_config);
+  uart_set_pin(UART_NUM_1, 5, 4, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+  esp_intr_alloc(ETS_UART1_INTR_SOURCE, 0, coreUartIsr, NULL, NULL);
+
+  rxBufHead = 1;
+  rxBufTail = 0;
+  uart_ll_set_rxfifo_full_thr(&UART1, 1);
+  uart_ll_ena_intr_mask(&UART1, UART_INTR_RXFIFO_FULL);
+}
+
+bool serialAvailable()
+{
+  if ((rxBufTail + 1) % UART_BUFFER_LEN != rxBufHead) return true;
+  else return false;
+}
+
+char serialRead()
+{
+  rxBufTail = (rxBufTail + 1) % UART_BUFFER_LEN;
+  return rxBuf[rxBufTail];
+}
+
+
+
+void zest_lightsleep(int64_t time)
+{
+  static esp_sleep_wakeup_cause_t wakeup_reason;
+
+  // This has a lot of overhead, so let's only comply if requested sleep is at least 20 ms
+  // and we sleep for 10 ms less just to allow for other housekeeping tasks to occur on time.
+  // Also we're sometimes called with negative time so make sure we ignore those.
+  if (time < 20) return;
+  time -= 10;
+
+  // Set which pins we need to hold, starting with LCD
+  gpio_hold_en(GPIO_NUM_0);
+  gpio_hold_en(GPIO_NUM_1);
+  gpio_hold_en(GPIO_NUM_10);
+  gpio_hold_en(GPIO_NUM_11);
+  gpio_hold_en(GPIO_NUM_22);
+  gpio_hold_en(GPIO_NUM_5); // CORE_RX
+  gpio_hold_en(GPIO_NUM_8); // MEAS
+  gpio_hold_en(GPIO_NUM_3); // EN_PERI
+  //gpio_hold_en(GPIO_NUM_15); // Backlight PWM keeps running in light sleep
+  gpio_hold_en(GPIO_NUM_23); // Buzzer
+  gpio_hold_en(GPIO_NUM_18);
+  gpio_hold_en(GPIO_NUM_19);
+  gpio_hold_en(GPIO_NUM_20);
+  gpio_hold_en(GPIO_NUM_21);
+  gpio_hold_en(GPIO_NUM_2);   // HBAT
+
+  // Light sleep
+  esp_sleep_enable_timer_wakeup(time*1000);
+
+  gpio_wakeup_enable(GPIO_NUM_6, GPIO_INTR_HIGH_LEVEL);
+  gpio_wakeup_enable(GPIO_NUM_9, GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable(GPIO_NUM_7, GPIO_INTR_HIGH_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+
+  gpio_sleep_set_direction(GPIO_NUM_4, GPIO_MODE_INPUT);
+  gpio_sleep_set_pull_mode(GPIO_NUM_4, GPIO_PULLUP_ONLY);
+  uart_set_wakeup_threshold(UART_NUM_1, 3);
+  esp_sleep_enable_uart_wakeup(UART_NUM_1);
+
+  esp_light_sleep_start();
+  wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+
+  // Unhold pins
+  gpio_hold_dis(GPIO_NUM_0);
+  gpio_hold_dis(GPIO_NUM_1);
+  gpio_hold_dis(GPIO_NUM_10);
+  gpio_hold_dis(GPIO_NUM_11);
+  gpio_hold_dis(GPIO_NUM_22);
+  gpio_hold_dis(GPIO_NUM_5); // CORE_RX
+  gpio_hold_dis(GPIO_NUM_8); // MEAS
+  gpio_hold_dis(GPIO_NUM_3); // EN_PERI
+  //gpio_hold_dis(GPIO_NUM_15); // Backlight
+  gpio_hold_dis(GPIO_NUM_23); // Buzzer
+  gpio_hold_dis(GPIO_NUM_18);
+  gpio_hold_dis(GPIO_NUM_19);
+  gpio_hold_dis(GPIO_NUM_20);
+  gpio_hold_dis(GPIO_NUM_21);
+  gpio_hold_dis(GPIO_NUM_2);   // HBAT
+
+  tNow = millis();
+
+  if (buttonA.read()) noSleepUntil(tNow + 1000);
+  if (buttonB.read()) noSleepUntil(tNow + 1000);
+  if (buttonC.read()) noSleepUntil(tNow + 1000);
+
+  while (serialAvailable()) serialRead();
+
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_UART)
+  {
+    zestBeep(beep_ms);
+  }
+}
+
+void zest_deepsleep()
+{
+  u8g2.setPowerSave(1);
+  delay(100);
+
+  // Set all LCD pins as outputs, low
+  pinMode(0, OUTPUT);
+  pinMode(1, OUTPUT);
+  pinMode(10, OUTPUT);
+  pinMode(11, OUTPUT);
+  pinMode(22, OUTPUT);
+  digitalWrite(0, LOW);
+  digitalWrite(1, LOW);
+  digitalWrite(10, LOW);
+  digitalWrite(11, LOW);
+  digitalWrite(22, LOW);
+
+  // Set all SD card pins as outputs, low
+  pinMode(16, OUTPUT);
+  pinMode(17, OUTPUT);
+  pinMode(18, OUTPUT);
+  pinMode(19, OUTPUT);
+  digitalWrite(16, LOW);
+  digitalWrite(17, LOW);
+  digitalWrite(18, LOW);
+  digitalWrite(19, LOW);
+
+  digitalWrite(EN_PERI, HIGH);
+  backlight(1); // Fade out
+  delay(400);
+
+  rtc_gpio_hold_en(GPIO_NUM_0);
+  rtc_gpio_hold_en(GPIO_NUM_1);
+  rtc_gpio_hold_en(GPIO_NUM_10);
+  rtc_gpio_hold_en(GPIO_NUM_11);
+  rtc_gpio_hold_en(GPIO_NUM_22);
+  rtc_gpio_hold_en(GPIO_NUM_5); // CORE_RX
+  rtc_gpio_hold_en(GPIO_NUM_8); // MEAS
+  rtc_gpio_hold_en(GPIO_NUM_3); // EN_PERI
+  rtc_gpio_hold_en(GPIO_NUM_15); // Backlight
+  rtc_gpio_hold_en(GPIO_NUM_23); // Buzzer
+  rtc_gpio_hold_en(GPIO_NUM_18);
+  rtc_gpio_hold_en(GPIO_NUM_19);
+  rtc_gpio_hold_en(GPIO_NUM_20);
+  rtc_gpio_hold_en(GPIO_NUM_21);
+  rtc_gpio_hold_en(GPIO_NUM_2);   // HBAT
+
+  esp_sleep_enable_ext1_wakeup_io(0xC0, ESP_EXT1_WAKEUP_ANY_HIGH);
+  rtc_gpio_pulldown_dis(GPIO_NUM_6);
+  rtc_gpio_pullup_dis(GPIO_NUM_6);
+  rtc_gpio_pulldown_dis(GPIO_NUM_7);
+  rtc_gpio_pullup_dis(GPIO_NUM_7);
+  esp_deep_sleep_start();
+  // Chip dead at this point. Will wake up through reset
+}
+
+
+void updateHistory(float newValue, float *history)
+{
+  uint16_t i;
+  history[HIST_LEN] = newValue; // array is HIST_LEN + 1 sized
+  for (i = 0; i < HIST_LEN; i++)
+  {
+    history[i] = history[i + 1];
+  }
+}
+
+void drawHistory(float *history)
+{
+  float historyMax;
+  uint16_t i;
+  uint8_t s0, s1;
+
+  historyMax = 0;
+  for (i = 0; i < HIST_LEN; i++)
+  {
+    if (history[i] > historyMax) historyMax = history[i];
+  }
+
+  for (i = 0; i < HIST_LEN - 1; i++)
+  {
+    s0 = 31.0*history[i]/historyMax;
+    s1 = 31.0*history[i+1]/historyMax;
+    u8g2.drawLine(i, 31 - s0, i + 1, 31 - s1);
+  }
+
+  // Draw cursor
+
+  i = HIST_LEN;
+  s0 = 31.0*history[HIST_LEN]/historyMax;
+  u8g2.drawTriangle(i, 31 - s0, i + 3, 31 - s0 - 3, i + 3, 31 - s0 + 3);
+
+  u8g2.drawLine(64, 0, 64, 32);
+}
+
+
+zestApp_t app_menu = {NULL, "a", "a", &app_menu_updateUI, &app_menu_updateService, NULL};
+
+zestApp_t mainMenuList[] = 
+{
+  {&app_menu, "Power",    "\xEB",   &app_power_updateUI,    &app_power_updateService,     NULL},
+  {&app_menu, "CPM",      "\x8D",   &app_cpm_updateUI,      &app_cpm_updateService,       NULL},
+  {&app_menu, "uSv/h",    "\x64",   &app_usv_updateUI,      &app_usv_updateService,       NULL},
+  {&app_menu, "Spectrum", "\x58",   &app_sp_updateUI,       &app_sp_updateService,        NULL},
+  {&app_menu, "HTTP",     "\xF7",   &app_http_updateUI,     &app_http_updateService,      &app_http_maySleepFor},
+  {&app_menu, "TCP",      "\xF7",   &app_tcp_updateUI,      &app_tcp_updateService,       &app_tcp_maySleepFor},
+  {&app_menu, "Endpoint", "\x80",   &app_endpoint_updateUI, &app_endpoint_updateService,  NULL},
+  {&app_menu, "BLE",      "\x5E",   &app_ble_updateUI,      &app_ble_updateService,       &app_ble_maySleepFor},
+  {&app_menu, "SD Log",   "\x80",   &app_log_updateUI,      &app_log_updateService,       NULL},
+  {&app_menu, "Settings", "\x81",   &app_settings_updateUI, &app_settings_updateService,  NULL},
+  {&app_menu, "Info",     "\xBC",   &app_info_updateUI,     &app_info_updateService,      NULL},
+};
+
+
+void serviceRequest(uint8_t service)
+{
+  uint8_t i;
+
+  // If we just start the dosimetry
+  // service, make sure we start fresh
+  if ( (service == SERVICE_DOSIMETRY) && (serviceList[service] == 0) )
+  {
+    serviceSkipMeasurement = true;
+    cpm_euroFilter = new OneEuroFilter(1.0, 0.002670, 0.0000153);
+    usv_euroFilter = new OneEuroFilter(1.0, 0.010515, 0.042970);
+    serviceCpm = 0;
+    serviceCpmRaw = 0;
+    serviceUsv = 0;
+    serviceUsvRaw = 0;
+    for (i = 0; i < HIST_LEN; i++)
+    {
+      bufHistoryCpm[i] = 0;
+      bufHistoryUsv[i] = 0;
+    }
+  }
+
+  serviceList[service]++;
+}
+
+void serviceRelease(uint8_t service)
+{
+  if (serviceList[service] > 0)
+  {
+    serviceList[service]--;
+
+    // If we need to stop the dosimetry
+    // service, make sure we clean up
+    if ( (service == SERVICE_DOSIMETRY) && (serviceList[service] == 0) )
+    {
+      delete cpm_euroFilter;
+      delete usv_euroFilter;
+    }
+  }
+}
+
+// Returns if a service has been triggered and is now running
+bool serviceCall(bool restart)
+{
+  static uint8_t serviceNum = 0;
+  uint8_t i;
+
+  if (restart) serviceNum = 0;
+
+  // First 4 services represent Core commands
+  while ((serviceList[serviceNum] == 0) && (serviceNum < 4))
+  {
+    serviceNum++;
+  }
+
+  if (serviceNum < 4)
+  {
+    switch (serviceNum)
+    {
+      case SERVICE_CONFIG:
+        coreCommand("c");
+        break;
+      case SERVICE_SYSTEM:
+        coreCommand("s");
+        break;
+      case SERVICE_DOSIMETRY:
+        coreCommand("m");
+        break;
+      case SERVICE_SPECTROSCOPY:
+        coreCommand("h");
+        break;
+    }
+    serviceNum++;
+    return true;
+  }
+  else
+  {
+    return false;
+  }
+}
+
+void app_menuScreen(char *name, char *icon)
+{
+  uint8_t i;
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_logisoso16_tf);
+  i = u8g2.getStrWidth(name);
+  u8g2.drawStr(64 - (16 + 4 + i)/2 + 16 + 4, 24, name);
+  u8g2.setFont(u8g2_font_open_iconic_all_2x_t);
+  u8g2.drawStr(64 - (16 + 4 + i)/2, 24, icon);
+  u8g2.drawTriangle(0, 15, 10, 0, 10, 30);
+  u8g2.drawTriangle(127, 15, 117, 0, 117, 30);
+  u8g2.sendBuffer();
+}
+
+bool app_menu_updateUI(uint8_t buttonFlags)
+{
+  static int8_t menuSelection = 0;
+  static int8_t numApps = sizeof(mainMenuList) / sizeof(zestApp_t);
+
+  if ((buttonFlags & (1 << BUTTON_1)) != 0)
+  {
+    // go backwards
+    menuSelection--;
+    if (menuSelection < 0) menuSelection = numApps - 1;
+  }
+
+  if ((buttonFlags & (1 << BUTTON_3)) != 0)
+  {
+    // go forward
+    menuSelection++;
+    if (menuSelection >= numApps) menuSelection = 0;
+  }
+
+  app_menuScreen(mainMenuList[menuSelection].name, mainMenuList[menuSelection].icon);
+
+  if ((buttonFlags & (1 << BUTTON_2)) != 0)
+  {
+    runningApp = &mainMenuList[menuSelection];
+    return false;
+  }
+
+  return true;
+}
+
+bool app_menu_updateService(uint8_t serviceFlags)
+{
+  return true;
+}
+
+void backlight(uint8_t command)
+{
+  static bool lightOn = false;
+  if (command == 3)                     // Go immediately to level
+  {
+    ledcWrite(BACKLIGHT, backlightIntensity);
+    lightOn = true;
+  }
+  if (!lightOn && (command == 2))       // Switch on
+  {
+    ledcWrite(BACKLIGHT, backlightIntensity);
+    lightOn = true;
+  }
+  else if (lightOn && (command == 1))   // Fade out
+  {
+    ledcFade(BACKLIGHT, backlightIntensity, 0, 300);
+    lightOn = false;
+  }
+  else if (command == 0)                // Off immediately
+  {
+    ledcWrite(BACKLIGHT, 0);
+    lightOn = false;
+  }
+
+  if (lightOn) tLightOff = millis() + backlightSeconds * 1000;
+}
 
 
 void setup()
 {
   esp_sleep_wakeup_cause_t wakeup_reason;
+  uint16_t i;
 
   wakeup_reason = esp_sleep_get_wakeup_cause();
   if ((wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) || (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER))
@@ -192,30 +672,13 @@ void setup()
     rtc_gpio_hold_dis(GPIO_NUM_2);   // HBAT
   }
 
-  Serial1.setRxBufferSize(16384);
-  //Serial1.begin(115200);  // UART
-  Serial1.begin(921600);  // UART
-  
-  Serial.begin(115200);   // USB CDC
-
-  GPS.begin(9600);
-  GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
-  GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ); // 1 Hz update rate
+  // Can this be made to work without rebooting ESP32 on connect / disconnect?
+  //Serial.begin(115200);   // USB CDC
 
   preferences.begin("pomeloZest", false);
   wifi_ssid = preferences.getString("ssid", ""); 
   wifi_pass = preferences.getString("password", "");
   preferences.end();
-  wifiOk = false;
-  wifiAP = false;
-
-  jsonData.reserve(16384);
-
-  u8g2.begin();
-
-  sdOk = false;
-  fileLogging = false;
-
 
   pinMode(BUT1_A, INPUT);
   pinMode(BUT2_B, INPUT);
@@ -225,10 +688,6 @@ void setup()
   buttonB.begin();
   buttonC.begin();
 
-  buttonA.enableInterrupt(isr_BUT1_A);
-  buttonB.enableInterrupt(isr_BUT2_B);
-  buttonC.enableInterrupt(isr_BUT3_C);
-
   buttonA.onPressed(onButtonAPressed);
   buttonB.onPressed(onButtonBPressed);
   buttonC.onPressed(onButtonCPressed);
@@ -237,12 +696,7 @@ void setup()
   buttonB.onPressedFor(750, onButtonBLongPressed);
   buttonC.onPressedFor(750, onButtonCLongPressed);
 
-  pressed_BUT1_A = false;
-  pressed_BUT2_B = false;
-  pressed_BUT3_C = false;
-  pressed_BUT1_A_long = false;
-  pressed_BUT2_B_long = false;
-  pressed_BUT3_C_long = false;
+  pressedButtonFlags = 0;
 
   pinMode(EN_PERI, OUTPUT);
   pinMode(MEAS, OUTPUT);
@@ -255,202 +709,319 @@ void setup()
   digitalWrite(BUZZER, LOW);
   digitalWrite(2, LOW);
 
+  u8g2.begin();
+
+  // Espressif hackery to make PWM work in light sleep
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RC_FAST, ESP_PD_OPTION_ON);
+  uint32_t val = PMU.hp_sys[PMU_MODE_HP_SLEEP].icg_func;
+  PMU.hp_sys[PMU_MODE_HP_SLEEP].icg_func = (val | BIT(PMU_ICG_FUNC_ENA_LEDC) | BIT(PMU_ICG_FUNC_ENA_IOMUX));
+  ledcSetClockSource(LEDC_USE_RC_FAST_CLK);
+
+  ledcAttach(BACKLIGHT, 2000, 8);
+  ledcWrite(BACKLIGHT, 0);
+  gpio_sleep_sel_dis(GPIO_NUM_15);
+
+  ledcAttach(BUZZER, 2000, 8);
+  ledcWrite(BUZZER, 0);
+  beep_ms = 2;
+  Timer0 = timerBegin(1000000);
+  timerAttachInterrupt(Timer0, timer0_ISR);
+  timerStop(Timer0);
+
   tNow = millis();
-  tDisplay = tNow;
-  tLastPulse = tNow;
-  tLog = tNow;
+  tCanSleep = tNow;
+  tLightOff = tNow;
 
-  for (histCounts = 0; histCounts < 1024; histCounts++)
+  for (i = 0; i < 1024; i++)
   {
-    hist[histCounts] = 0;
+    serviceHist[i] = 0;
   }
 
-  for (histCounts = 0; histCounts < HIST_LEN; histCounts++)
+  for (i = 0; i < HIST_LEN; i++)
   {
-    bufHistory[histCounts] = 0;
+    bufHistoryCpm[i] = 0;
+    bufHistoryUsv[i] = 0;
   }
 
-  histCounts = 0;
-  histTime = 0;
-  histTemp = -273;
-
-  euroFilterFreq = 1.0;
-  euroFilterMinCutoff = 1.0;
-  euroFilterBeta = 0.01;
-  euroFilter = new OneEuroFilter(euroFilterFreq, euroFilterMinCutoff, euroFilterBeta);
+  serviceHistCounts = 0;
+  serviceHistTime = 0;
+  serviceCoreTemp = -273;
 
   if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED)
   {
     // Hard reset
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_ncenB08_tr);
-    u8g2.drawStr(0,10,"Hard reset");
-    u8g2.sendBuffer();
-    delay(500);
-    spectrumLog = true;
-
-    core_shutdown = false;
-    Serial1.write("x\n");
-
-    displayMode = DISPLAY_MAIN;
-    Serial1.write("o0\n");
+    backlightEnabled = true;
+    backlightSeconds = 5;
+    backlightIntensity = 50;
   }
-  else if (wakeup_reason == ESP_SLEEP_WAKEUP_GPIO)
+
+  for (i = 0; i++; i < 8) serviceList[i] = 0;
+  serviceRunning = false;
+  serviceSkipMeasurement = false;
+  serviceUpdateFlags = 0;
+
+  if (backlightEnabled) backlight(2); // Switch on
+
+  runningApp = &app_menu;
+  runningApp->updateUI(0);
+
+  serialConfig();
+  while (serialAvailable()) serialRead();
+
+  // Make pulse char 0xAA (170 decimal),
+  // such that it has several transitions
+  coreCommand("l170\n");
+
+  // If DAQ is stopped it will be restarted. Otherwise
+  // it'll let it continue undisturbed
+  coreCommand("s");
+  startDaq = true;
+
+
+  wifi_connected = false;
+  wifi_AP = false;
+  wifi_reconnecting = false;
+  wifi_tReconnect = 0;
+  wifi_mdns = false;
+}
+
+
+
+void loop()
+{
+  static uint16_t bufIdx = 0;
+  static uint8_t rxChar;
+  static int32_t maySleep, maySleepApp;
+
+  tNow = millis();
+
+  if (buttonA.read()) noSleepUntil(tNow + 1000);
+  if (buttonB.read()) noSleepUntil(tNow + 1000);
+  if (buttonC.read()) noSleepUntil(tNow + 1000);
+
+  if (tNow >= tCanSleep)
   {
-    // wake up from deep sleep by GPIO
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_ncenB08_tr);
-    u8g2.drawStr(0,10,"GPIO wakeup");
-    u8g2.sendBuffer();
-    delay(500);
-  }
-  else if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1)
-  {
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_ncenB08_tr);
-    u8g2.drawStr(0,10,"EXT1 wakeup");
-    sprintf(buf, "0x%X", esp_sleep_get_ext1_wakeup_status());
-    u8g2.drawStr(0,20,buf);
-    u8g2.sendBuffer();
-    delay(500);
-    if (core_shutdown)
+    maySleep = tService - tNow;
+    maySleepApp = maySleep; // just to have a sensible value in case app does not care
+
+    if (runningApp->maySleepFor != NULL) maySleepApp = runningApp->maySleepFor();
+    if (maySleepApp < maySleep) maySleep = maySleepApp;
+
+    if (serviceRunning) maySleepApp = tServiceWait - tNow;
+    if (maySleepApp < maySleep) maySleep = maySleepApp;
+
+    if (backlightEnabled && (tLightOff > tNow))
     {
-      core_shutdown = false;
-      Serial1.write("x\n");
+      maySleepApp = (int64_t)tLightOff - (int64_t)tNow;
+      if (maySleepApp < maySleep) maySleep = maySleepApp;
     }
-    Serial1.write("o0\n");
+
+    zest_lightsleep(maySleep);
   }
-  else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER)
+
+  if (pressedButtonFlags != 0)
+  {
+    if (backlightEnabled) backlight(2); // Switch on
+  }
+
+  if (tNow >= tService)
+  {
+    tService += 1000;
+    serviceRunning = serviceCall(true);
+    tServiceWait = tNow + 150;
+    if (serviceList[SERVICE_TICK] != 0) serviceUpdateFlags |= (1 << SERVICE_TICK);
+  }
+  
+  if (serviceRunning)
+  {
+    if (tNow >= tServiceWait)
+    {
+      serviceRunning = serviceCall(false);
+      tServiceWait = tNow + 150;
+    }
+  }
+
+  if (serviceUpdateFlags != 0)
+  {
+    runningApp->updateService(serviceUpdateFlags);
+    serviceUpdateFlags = 0;
+  }
+
+  if (pressedButtonFlags != 0)
+  {
+    if (!runningApp->updateUI(pressedButtonFlags))
+    {
+      // Previous app quit. Run update on new
+      // app to update display
+      runningApp->updateUI(0);
+    }
+    pressedButtonFlags = 0;
+  }
+
+  if (serviceList[SERVICE_DATASTREAM] != 0)
+  {
+    // Just keep application running as this
+    // needs to also monitor incoming connections
+    runningApp->updateUI(0);
+  }
+
+  if ((tNow >= tLightOff) && (backlightSeconds != 0))
+  {
+    backlight(1); // Fade out
+  }
+
+  if (serialAvailable())
+  {
+    noSleepUntil(tNow + 50);
+    if (serviceList[SERVICE_DATASTREAM] != 0)
+    {
+      while (serialAvailable())
+      {
+        if (!runningApp->updateService(1 << SERVICE_DATASTREAM))
+          break;
+      }
+    }
+    else
+    {
+      while (serialAvailable())
+      {
+        rxChar = serialRead();
+        if (rxChar == '\n')
+        {
+          buf[bufIdx] = 0;
+          parseBuffer(buf);
+          bufIdx = 0;
+        }
+        else
+        {
+          buf[bufIdx] = rxChar;
+          if (bufIdx < sizeof(buf))
+          {
+            bufIdx++;
+          }
+          else
+          {
+            bufIdx = 0;
+          }
+        }
+      }
+    }
+  }
+}
+
+
+void parseBuffer(char* payload)
+{
+  DynamicJsonDocument doc(49152);
+  DeserializationError error = deserializeJson(doc, payload);
+
+  if (error)
   {
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_ncenB08_tr);
-    u8g2.drawStr(0,10,"Timer wakeup");
+    u8g2.drawStr(0, 10, "JSON Error");
+    u8g2.drawStr(0, 20, error.c_str());
+    u8g2.drawStr(0, 30, buf);
     u8g2.sendBuffer();
-    delay(500);
+    delay(100);
+    return;
   }
+
+  // Next service (if necessary) can be called
+  // on the next loop iteration
+  tServiceWait = tNow;
+
+  // Throw in a button check just for good measure. Application
+  // parseData might take a while to update the screen
+  if (buttonA.read()) noSleepUntil(tNow + 1000);
+  if (buttonB.read()) noSleepUntil(tNow + 1000);
+  if (buttonC.read()) noSleepUntil(tNow + 1000);
+
+  if (doc["type"] == "dosimetry") parseDataDosimetry(&doc);
+  if (doc["type"] == "spectrum") parseDataSpectrum(&doc);
+  if (doc["type"] == "config") parseDataConfig(&doc);
+  if (doc["type"] == "system") parseDataSystem(&doc);
 }
 
 
-void zest_lightsleep(uint64_t time)
+void parseDataDosimetry(DynamicJsonDocument *doc)
 {
-  // Set which pins we need to hold, starting with LCD
-  gpio_hold_en(GPIO_NUM_0);
-  gpio_hold_en(GPIO_NUM_1);
-  gpio_hold_en(GPIO_NUM_10);
-  gpio_hold_en(GPIO_NUM_11);
-  gpio_hold_en(GPIO_NUM_22);
-  gpio_hold_en(GPIO_NUM_5); // CORE_RX
-  gpio_hold_en(GPIO_NUM_8); // MEAS
-  gpio_hold_en(GPIO_NUM_3); // EN_PERI
-  gpio_hold_en(GPIO_NUM_15); // Backlight
-  gpio_hold_en(GPIO_NUM_23); // Buzzer
-  gpio_hold_en(GPIO_NUM_18);
-  gpio_hold_en(GPIO_NUM_19);
-  gpio_hold_en(GPIO_NUM_20);
-  gpio_hold_en(GPIO_NUM_21);
-  gpio_hold_en(GPIO_NUM_2);   // HBAT
-
-  // Light sleep
-  gpio_wakeup_enable(GPIO_NUM_6, GPIO_INTR_HIGH_LEVEL);
-  gpio_wakeup_enable(GPIO_NUM_9, GPIO_INTR_LOW_LEVEL);
-  gpio_wakeup_enable(GPIO_NUM_7, GPIO_INTR_HIGH_LEVEL);
-  esp_sleep_enable_gpio_wakeup();
-  esp_sleep_enable_timer_wakeup(time*1000);
-  //t0 = esp_timer_get_time();
-  esp_light_sleep_start();
-  //t1 = esp_timer_get_time();
-
-  // Unhold pins
-  gpio_hold_dis(GPIO_NUM_0);
-  gpio_hold_dis(GPIO_NUM_1);
-  gpio_hold_dis(GPIO_NUM_10);
-  gpio_hold_dis(GPIO_NUM_11);
-  gpio_hold_dis(GPIO_NUM_22);
-  gpio_hold_dis(GPIO_NUM_5); // CORE_RX
-  gpio_hold_dis(GPIO_NUM_8); // MEAS
-  gpio_hold_dis(GPIO_NUM_3); // EN_PERI
-  gpio_hold_dis(GPIO_NUM_15); // Backlight
-  gpio_hold_dis(GPIO_NUM_23); // Buzzer
-  gpio_hold_dis(GPIO_NUM_18);
-  gpio_hold_dis(GPIO_NUM_19);
-  gpio_hold_dis(GPIO_NUM_20);
-  gpio_hold_dis(GPIO_NUM_21);
-  gpio_hold_dis(GPIO_NUM_2);   // HBAT
-
-  //return (t1 - t0) / 1000;
-}
-
-void zest_deepsleep()
-{
-  u8g2.setPowerSave(1);
-  digitalWrite(EN_PERI, HIGH);
-
-  delay(500);
-
-  rtc_gpio_hold_en(GPIO_NUM_0);
-  rtc_gpio_hold_en(GPIO_NUM_1);
-  rtc_gpio_hold_en(GPIO_NUM_10);
-  rtc_gpio_hold_en(GPIO_NUM_11);
-  rtc_gpio_hold_en(GPIO_NUM_22);
-  rtc_gpio_hold_en(GPIO_NUM_5); // CORE_RX
-  rtc_gpio_hold_en(GPIO_NUM_8); // MEAS
-  rtc_gpio_hold_en(GPIO_NUM_3); // EN_PERI
-  rtc_gpio_hold_en(GPIO_NUM_15); // Backlight
-  rtc_gpio_hold_en(GPIO_NUM_23); // Buzzer
-  rtc_gpio_hold_en(GPIO_NUM_18);
-  rtc_gpio_hold_en(GPIO_NUM_19);
-  rtc_gpio_hold_en(GPIO_NUM_20);
-  rtc_gpio_hold_en(GPIO_NUM_21);
-  rtc_gpio_hold_en(GPIO_NUM_2);   // HBAT
-
-
-  // Deep sleep -- now it works, but very bad choice for button placement
-  esp_sleep_enable_ext1_wakeup_io(0xC0, ESP_EXT1_WAKEUP_ANY_HIGH);
-  rtc_gpio_pulldown_dis(GPIO_NUM_6);
-  rtc_gpio_pullup_dis(GPIO_NUM_6);
-  rtc_gpio_pulldown_dis(GPIO_NUM_7);
-  rtc_gpio_pullup_dis(GPIO_NUM_7);
-  esp_deep_sleep_start();
-  // Chip dead at this point. Will wake up through reset
-}
-
-
-
-void drawHistory(uint32_t newValue)
-{
-  uint32_t historyMax;
+  float cpm, usv;
   uint16_t i;
-  uint8_t s0, s1;
 
-  historyMax = 0;
-  bufHistory[HIST_LEN] = newValue; // array is HIST_LEN + 1 sized
-  for (i = 0; i < HIST_LEN; i++)
+  cpm = (*doc)["payload"]["cpm"].as<float>();
+  usv = (*doc)["payload"]["uSv/h"].as<float>();
+
+  if (serviceSkipMeasurement)
   {
-    bufHistory[i] = bufHistory[i + 1];
-    if (bufHistory[i] > historyMax) historyMax = bufHistory[i];
+    serviceSkipMeasurement = false;
   }
-
-  for (i = 0; i < HIST_LEN - 1; i++)
+  else
   {
-    s0 = 31.0*bufHistory[i]/historyMax;
-    s1 = 31.0*bufHistory[i+1]/historyMax;
-    u8g2.drawLine(i, 31 - s0, i + 1, 31 - s1);
+    serviceCpmRaw = cpm;
+    serviceCpm = cpm_euroFilter->filter(cpm);
+    serviceUsvRaw = usv;
+    serviceUsv = usv_euroFilter->filter(usv);
+    bufHistoryCpm[HIST_LEN] = serviceCpm;
+    bufHistoryUsv[HIST_LEN] = serviceUsv;
+    for (i = 0; i < HIST_LEN; i++)
+    {
+      bufHistoryCpm[i] = bufHistoryCpm[i + 1];
+      bufHistoryUsv[i] = bufHistoryUsv[i + 1];
+    }
+    serviceUpdateFlags |= (1 << SERVICE_DOSIMETRY);
   }
-
-  // Draw cursor
-
-  i = HIST_LEN;
-  s0 = 31.0*bufHistory[HIST_LEN]/historyMax;
-  u8g2.drawTriangle(i, 31 - s0, i + 3, 31 - s0 - 3, i + 3, 31 - s0 + 3);
-
-  u8g2.drawLine(64, 0, 64, 32);
 }
 
+void parseDataConfig(DynamicJsonDocument *doc)
+{
+  uint32_t uartPulse;
+  uartPulse = (*doc)["payload"]["outputs"]["uart"]["fastPulse"].as<int>();
+  if (uartPulse != 0) serviceUartPulse = true;
+  else serviceUartPulse = false;
+  serviceUpdateFlags |= (1 << SERVICE_CONFIG);
+}
 
-void drawSpectrum()
+void parseDataSystem(DynamicJsonDocument *doc)
+{
+  serviceCoreTemp = (*doc)["payload"]["temperature"].as<float>();
+  serviceCoreRunning = (*doc)["payload"]["running"].as<int>();
+  strcpy(serviceCoreSN, (*doc)["payload"]["sn"].as<String>().c_str());
+  if (startDaq)
+  {
+    startDaq = false;
+    if (serviceCoreRunning == 0) coreCommand("x");
+  }
+  serviceUpdateFlags |= (1 << SERVICE_SYSTEM);
+}
+
+void parseDataSpectrum(DynamicJsonDocument *doc)
 {
   uint16_t i;
-  char buf[80];
+
+  for (i = 0; i < 1024; i++)
+  {
+    serviceHist[i] = (*doc)["payload"]["data"][i].as<unsigned long long>();
+  }
+
+  serviceHistCounts = (*doc)["payload"]["count"].as<unsigned long long>();
+  serviceHistTime = (*doc)["payload"]["time"].as<unsigned long long>();
+  serviceCoreTemp = (*doc)["payload"]["temperature"].as<float>();
+  serviceHistEcal[0] = (*doc)["payload"]["ecal"][0].as<float>();
+  serviceHistEcal[1] = (*doc)["payload"]["ecal"][1].as<float>();
+  serviceHistEcal[2] = (*doc)["payload"]["ecal"][2].as<float>();
+
+  serviceCoreTemp = (*doc)["payload"]["temperature"].as<float>();
+  serviceCoreRunning = (*doc)["payload"]["running"].as<int>();
+  strcpy(serviceCoreSN, (*doc)["payload"]["sn"].as<String>().c_str());
+  
+  serviceUpdateFlags |= (1 << SERVICE_SYSTEM) | (1 << SERVICE_SPECTROSCOPY);
+}
+
+
+void drawSpectrum(bool log)
+{
+  uint16_t i;
   float spectrum[128];
   float spectrumMax;
   uint8_t s;
@@ -462,10 +1033,10 @@ void drawSpectrum()
   
   for (i = 0; i < 1024; i++)
   {
-    spectrum[i/8] += hist[i];
+    spectrum[i/8] += serviceHist[i];
   }
 
-  if (spectrumLog)
+  if (log)
   {
     for (i = 0; i < 128; i++)
     {
@@ -487,7 +1058,7 @@ void drawSpectrum()
     if (s != 0) u8g2.drawLine(i, 31, i, 31 - s);
   }
   u8g2.setFont(u8g2_font_t0_11b_tr);
-  if (spectrumLog)
+  if (log)
   {
     u8g2.drawStr(0, 10, "L");
     u8g2.drawStr(0, 20, "o");
@@ -499,1257 +1070,169 @@ void drawSpectrum()
     u8g2.drawStr(0, 20, "i");
     u8g2.drawStr(0, 30, "n");
   }
-  sprintf(buf, "%d", histCounts);
-  u8g2.drawStr(80, 10, buf);
+  sprintf(printBuf, "%d", serviceHistCounts);
+  u8g2.drawStr(80, 10, printBuf);
   u8g2.sendBuffer();
-  //zest_lightsleep(900);
 }
 
-void logSpectrum()
+
+void wifiConnectAP()
 {
-  DynamicJsonDocument doc(32768);
-  //DeserializationError error = deserializeJson(doc, payload);
-  static float lat, lon;
-  static uint16_t i;
-
-  // First reset spectrum on Core
-  Serial1.write("x");
-
-  // Now save log to currently open file
-  if (displayMode == DISPLAY_LOG_GPS)
+  if (!wifi_connected)
   {
-    lat = GPS.latitudeDegrees;
-    lon = GPS.longitudeDegrees;
-    if (GPS.lat == 'S') lat = -lat;
-    if (GPS.lon == 'W') lon = -lon;
-
-    doc["timestamp"]["year"] = GPS.year;
-    doc["timestamp"]["month"] = GPS.month;
-    doc["timestamp"]["day"] = GPS.day;
-    doc["timestamp"]["hour"] = GPS.hour;
-    doc["timestamp"]["minute"] = GPS.minute;
-    doc["timestamp"]["seconds"] = GPS.seconds;
-
-    doc["location"]["lat"] = lat;
-    doc["location"]["lon"] = lon;
-    doc["location"]["speed"] = GPS.speed;
-    doc["location"]["fix"] = (int)GPS.fix;
-    doc["location"]["fixQ"] = (int)GPS.fixquality;
-    doc["location"]["angle"] = GPS.angle;
-    doc["location"]["alt"] = GPS.altitude;
-    doc["location"]["nSat"] = (int)GPS.satellites;
-    doc["location"]["hdop"] = GPS.HDOP;
+    WiFi.mode(WIFI_AP);
+    WiFi.enableAP(true);
+    Network.macAddress(wifi_MAC);
+    sprintf(printBuf, "P-%02X%02X", wifi_MAC[4], wifi_MAC[5]);
+    WiFi.softAP(printBuf, "pomelopw");
+    wifi_IP = WiFi.softAPIP();
+    wifi_connected = true;
+    wifi_AP = true;
   }
-  else
+}
+
+void wifiConnectSTA()
+{
+  if (!wifi_connected)
   {
-    doc["timestamp"]["year"] = rtc.getYear();
-    doc["timestamp"]["month"] = rtc.getMonth();
-    doc["timestamp"]["day"] = rtc.getDay();
-    doc["timestamp"]["hour"] = rtc.getHour(true);
-    doc["timestamp"]["minute"] = rtc.getMinute();
-    doc["timestamp"]["seconds"] = rtc.getSecond();
-  }
-
-  doc["spectrum"]["time"] = histTime;
-  doc["spectrum"]["counts"] = histCounts;
-  doc["spectrum"]["temperature"] = histTemp;
-  for (i = 0; i < 1024; i++)
-  {
-    doc["spectrum"]["hist"][i] = hist[i];
-  }
-
-  serializeJson(doc, buf);
-  logFile.println(buf);
-
-  logFileEntry++;
-
-  if (logFileEntry > 100)
-  {
-    logFileEntry = 0;
-    logFile.close();
-
-    logFileNumber++;
-    sprintf(buf, "/%s/%08lu.csv", logDir, logFileNumber);
-    logFile = SD.open(buf, FILE_WRITE);
-    if (logFile)
+    if (wifi_ssid != "")
     {
-      u8g2.drawStr(0,10,"New file");
+      WiFi.mode(WIFI_STA);
+      WiFi.enableSTA(true);
+      WiFi.begin(wifi_ssid, wifi_pass);
+      for (int i = 0; i < 10; i++)
+      {
+        u8g2.clearBuffer();
+        u8g2.setFont(u8g2_font_ncenB08_tr);
+        u8g2.drawStr(10,10, "Connection attempt");
+        sprintf(printBuf, "%d/10", i);
+        u8g2.drawStr(55,20, printBuf);
+        u8g2.sendBuffer();
+
+        if (WiFi.status() == WL_CONNECTED)
+        {
+          break;
+        }
+        delay(300);
+      }
+
+      u8g2.clearBuffer();
+      u8g2.setFont(u8g2_font_ncenB08_tr);
+      if (WiFi.status() == WL_CONNECTED)
+      {
+        wifi_IP = WiFi.localIP();
+        wifi_connected = true;
+        wifi_AP = false;
+        u8g2.drawStr(0,10, "Connected to network");
+      }
+      else
+      {
+        WiFi.disconnect(true, false, 0);
+        WiFi.mode(WIFI_OFF);
+        u8g2.drawStr(0,10, "Connection failed");
+      }
+      u8g2.sendBuffer();
+      delay(500);
+    }
+  }
+}
+
+void wifiDisconnect()
+{
+  if (wifi_connected)
+  {
+    if (wifi_AP)
+    {
+      WiFi.softAPdisconnect(true); 
     }
     else
     {
-      u8g2.drawStr(0,10,"Cannot create new file");
-      fileLogging = false;
+      WiFi.disconnect(true, false, 0);
+    }
+    delay(300);
+    WiFi.mode(WIFI_OFF);
+    wifi_connected = false;
+    wifi_AP = false;
+  }
+}
+
+void wifiCheck()
+{
+  if (wifi_connected && !wifi_AP)
+  {
+    if (WiFi.status() != WL_CONNECTED)
+    {
+      wifi_reconnecting = true;
+      wifi_tReconnect = 0;
+    }
+  }
+
+  if (wifi_reconnecting)
+  {
+    if (wifi_tReconnect == 0)
+    {
+      if (WiFi.status() != WL_CONNECTED)
+      {
+        WiFi.disconnect(true, false, 0);
+        delay(300);
+        WiFi.begin(wifi_ssid, wifi_pass);
+        wifi_tReconnect = 5;
+      }
+      else
+      {
+        wifi_reconnecting = false;
+      }
+    }
+    else
+    {
+      wifi_tReconnect--;
     }
   }
 }
 
-void parseSpectrum(DynamicJsonDocument *doc)
+void wifiStartMdns()
 {
-  uint16_t i;
+  esp_ip4_addr_t addr;
 
-  for (i = 0; i < 1024; i++)
+  if (mdns_init())
   {
-    hist[i] = (*doc)["payload"]["data"][i].as<unsigned long long>();
-  }
-
-  histCounts = (*doc)["payload"]["count"].as<unsigned long long>();
-  histTime = (*doc)["payload"]["time"].as<unsigned long long>();
-  histTemp = (*doc)["payload"]["temperature"].as<float>();
-  histEcal[0] = (*doc)["payload"]["ecal"][0].as<float>();
-  histEcal[1] = (*doc)["payload"]["ecal"][1].as<float>();
-  histEcal[2] = (*doc)["payload"]["ecal"][2].as<float>();
-
-
-  if (displayMode == DISPLAY_SP) drawSpectrum();
-  if ((displayMode == DISPLAY_LOG_GPS) && sdOk && fileLogging) logSpectrum();
-  if ((displayMode == DISPLAY_LOG) && sdOk && fileLogging) logSpectrum();
-}
-
-void parseDosimetry(DynamicJsonDocument *doc)
-{
-  float displayValue, cpm, uSvph;
-
-  cpm = (*doc)["payload"]["cpm"].as<float>();
-  uSvph = (*doc)["payload"]["uSv/h"].as<float>();
-
-  if (displayMode == DISPLAY_CPM)
-  {
-    displayValue = euroFilter->filter(cpm);
-
     u8g2.clearBuffer();
-    drawHistory((uint32_t)displayValue);
-    u8g2.setFont(u8g2_font_t0_11b_tr);
-    if (displayValue < 1000)
-    {
-      u8g2.drawStr(95, 32, "CPM");
-      u8g2.setFont(u8g2_font_fub20_tf);
-      sprintf(buf, "%3d", (uint16_t)displayValue);
-      u8g2.drawStr(83, 22, buf);
-    }
-    else if (displayValue < 10000)
-    {
-      u8g2.drawStr(92, 32, "kCPM");
-      u8g2.setFont(u8g2_font_fub20_tf);
-      sprintf(buf, "%.2f", displayValue/1000.0);
-      u8g2.drawStr(73, 22, buf);
-    }
-    else if (displayValue < 100000)
-    {
-      u8g2.drawStr(92, 32, "kCPM");
-      u8g2.setFont(u8g2_font_fub20_tf);
-      sprintf(buf, "%.1f", displayValue/1000.0);
-      u8g2.drawStr(73, 22, buf);
-    }
-    else if (displayValue < 1000000)
-    {
-      u8g2.drawStr(92, 32, "kCPM");
-      u8g2.setFont(u8g2_font_fub20_tf);
-      sprintf(buf, "%3d", (uint16_t)(displayValue/1000));
-      u8g2.drawStr(83, 22, buf);
-    }
-    else
-    {
-      u8g2.drawStr(92, 32, "MCPM");
-      u8g2.setFont(u8g2_font_fub20_tf);
-      sprintf(buf, "%.2f", displayValue/1000000.0);
-      u8g2.drawStr(73, 22, buf);
-    }
-
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.drawStr(10,10, "mDNS failed");
     u8g2.sendBuffer();
-  }
-  else if (displayMode == DISPLAY_USV)
-  {
-    displayValue = euroFilter->filter(uSvph);
-
-    u8g2.clearBuffer();
-
-    drawHistory((uint32_t)(displayValue*1000));
-
-    u8g2.setFont(u8g2_font_t0_11b_tr);
-    u8g2.drawStr(89, 32, "uSv/h");
-    u8g2.setFont(u8g2_font_fub20_tf);
-    if (displayValue < 10)
-    {
-      sprintf(buf, "%.2f", displayValue);
-      u8g2.drawStr(73, 22, buf);
-    }
-    else
-    {
-      sprintf(buf, "%3d", (uint16_t)displayValue);
-      u8g2.drawStr(83, 22, buf);
-    }
-    u8g2.sendBuffer();
-  }
-}
-
-void parseData(char* payload)
-{
-  DynamicJsonDocument doc(49152);
-  DeserializationError error = deserializeJson(doc, payload);
-
-  if (error)
-  {
+    delay(500);
+    wifi_mdns = false;
     return;
   }
 
-  if (doc["type"] == "spectrum")
+  wifi_mdns_name = "pomelo";
+  // Check for name conflict
+  esp_err_t err = mdns_query_a(wifi_mdns_name.c_str(), 2000, &addr);
+  if (err != ESP_ERR_NOT_FOUND)
   {
-    parseSpectrum(&doc);
+    // err == ESP_ERR_NOT_FOUND is the only good case. Otherwise we
+    // need to set up a more specific name for ourselves to not
+    // cause conflicts or confusion
+    Network.macAddress(wifi_MAC);
+    sprintf(printBuf, "pomelo-%02x%02x", wifi_MAC[4], wifi_MAC[5]);
+    wifi_mdns_name = printBuf;
   }
 
-  if (doc["type"] == "dosimetry")
+  if (mdns_hostname_set(wifi_mdns_name.c_str()))
   {
-    parseDosimetry(&doc);
+    wifi_mdns = false;
+    mdns_free();
+    return;
   }
 
+  wifi_mdns = true;
 }
 
-String processorN42(const String& var)
+void wifiStopMdns()
 {
-  static uint16_t i;
-  static char buf[64];
-  if(var == "C0")
+  if (wifi_mdns)
   {
-    sprintf(buf, "%8e", histEcal[0]);
-    return String(buf);
-  }
-  if(var == "C1")
-  {
-    sprintf(buf, "%8e", histEcal[1]);
-    return String(buf);
-  }
-  if(var == "C2")
-  {
-    sprintf(buf, "%8e", histEcal[2]);
-    return String(buf);
-  }
-  if(var == "DATETIME")
-  {
-    // 2003-11-22T23:45:19-07:00
-    sprintf(buf, "%s", rtc.getTime("%Y-%m-%dT%H:%M:%S").c_str());
-    return String(buf);
-  }
-  if(var == "DURATION")
-  {
-    sprintf(buf, "%d", histTime);
-    return String(buf);
-  }
-  if(var == "LIVE")
-  {
-    sprintf(buf, "%.2f", histTime*1.0 - histCounts*0.00007);  // About 70us dead time per event
-    return String(buf);
-  }
-  if(var == "SPECTRUM")
-  {
-    jsonData = "";
-    for (i = 0; i < 1023; i++)
-    {
-      sprintf(buf, "%d ", hist[i]);
-      jsonData.concat(buf);
-    }
-    sprintf(buf, "%d", hist[1023]);
-    jsonData.concat(buf);
-    return jsonData;
-  }
-  return String();
-}
-
-String processorHist(const String& var)
-{
-  static uint16_t i;
-  static char buf[16];
-  if(var == "DATA")
-  {
-    jsonData = "";
-    for (i = 0; i < 1023; i++)
-    {
-      sprintf(buf, "%d,", hist[i]);
-      jsonData.concat(buf);
-    }
-    sprintf(buf, "%d", hist[1023]);
-    jsonData.concat(buf);
-    return jsonData;
-  }
-  if(var == "COUNTS")
-  {
-    sprintf(buf, "%d", histCounts);
-    return String(buf);
-  }
-  if(var == "TIME")
-  {
-    sprintf(buf, "%d", histTime);
-    return String(buf);
-  }
-  return String();
-}
-
-void startServer()
-{
-  // Static pages, text
-  webServer.on("/uPlot.iife.min.js", HTTP_GET, [](AsyncWebServerRequest *request) { request->send_P(200, "text/javascript", uPlot_iife_min_js); });
-  webServer.on("/uPlot.min.css", HTTP_GET, [](AsyncWebServerRequest *request) { request->send_P(200, "text/css", uPlot_min_css); });
-  webServer.on("/browserconfig.xml", HTTP_GET, [](AsyncWebServerRequest *request) { request->send_P(200, "text/html", browserconfig_xml); });
-  webServer.on("/site.webmanifest", HTTP_GET, [](AsyncWebServerRequest *request) { request->send_P(200, "text/html", site_webmanifest); });
-
-  // Static resources, binary
-  webServer.on("/android-chrome-192x192.png", HTTP_GET, [](AsyncWebServerRequest *request) { AsyncWebServerResponse *response = request->beginResponse_P(200, "image/png", android_chrome_192x192_png, 14447); request->send(response); });
-  webServer.on("/android-chrome-512x512.png", HTTP_GET, [](AsyncWebServerRequest *request) { AsyncWebServerResponse *response = request->beginResponse_P(200, "image/png", android_chrome_512x512_png, 40687); request->send(response); });
-  webServer.on("/apple-touch-icon.png", HTTP_GET, [](AsyncWebServerRequest *request) { AsyncWebServerResponse *response = request->beginResponse_P(200, "image/png", apple_touch_icon_png, 9007); request->send(response); });
-  webServer.on("/favicon-16x16.png", HTTP_GET, [](AsyncWebServerRequest *request) { AsyncWebServerResponse *response = request->beginResponse_P(200, "image/png", favicon_16x16_png, 1106); request->send(response); });
-  webServer.on("/favicon-32x32.png", HTTP_GET, [](AsyncWebServerRequest *request) { AsyncWebServerResponse *response = request->beginResponse_P(200, "image/png", favicon_32x32_png, 2151); request->send(response); });
-  webServer.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest *request) { AsyncWebServerResponse *response = request->beginResponse_P(200, "image/vnd.microsoft.icon", favicon_ico, 15086); request->send(response); });
-  webServer.on("/mstile-144x144.png", HTTP_GET, [](AsyncWebServerRequest *request) { AsyncWebServerResponse *response = request->beginResponse_P(200, "image/png", mstile_144x144_png, 8925); request->send(response); });
-  webServer.on("/mstile-150x150.png", HTTP_GET, [](AsyncWebServerRequest *request) { AsyncWebServerResponse *response = request->beginResponse_P(200, "image/png", mstile_150x150_png, 8717); request->send(response); });
-  webServer.on("/mstile-310x150.png", HTTP_GET, [](AsyncWebServerRequest *request) { AsyncWebServerResponse *response = request->beginResponse_P(200, "image/png", mstile_310x150_png, 9366); request->send(response); });
-  webServer.on("/mstile-310x310.png", HTTP_GET, [](AsyncWebServerRequest *request) { AsyncWebServerResponse *response = request->beginResponse_P(200, "image/png", mstile_310x310_png, 17934); request->send(response); });
-  webServer.on("/mstile-70x70.png", HTTP_GET, [](AsyncWebServerRequest *request) { AsyncWebServerResponse *response = request->beginResponse_P(200, "image/png", mstile_70x70_png, 6320); request->send(response); });
-  webServer.on("/safari-pinned-tab.svg", HTTP_GET, [](AsyncWebServerRequest *request) { request->send_P(200, "text/html", safari_pinned_tab_svg); });
-
-  // Dynamic pages start here: index, wifi, time, spectrum
-  webServer.on("/spectrum.n42", HTTP_GET, [](AsyncWebServerRequest *request) { request->send_P(200, "application/octet-stream", n42_file, processorN42); });
-
-  webServer.on("/wifi.htm", HTTP_ANY, [](AsyncWebServerRequest *request)
-  {
-    int params = request->params();
-    bool update;
-    update = false;
-    for(int i=0;i<params;i++)
-    {
-      AsyncWebParameter* p = request->getParam(i);
-      if(p->isPost())
-      {
-        update = true;
-        if (p->name() == "ssid") wifi_ssid = p->value();
-        if (p->name() == "pass") wifi_pass = p->value();
-      }
-    }
-    if (update && wifi_ssid != "")
-    {
-      preferences.begin("pomeloZest", false);
-      preferences.putString("ssid", wifi_ssid); 
-      preferences.putString("password", wifi_pass);
-      preferences.end();
-    }
-    request->send_P(200, "text/html", wifi_htm); 
-  });
-
-  webServer.on("/time.htm", HTTP_ANY, [](AsyncWebServerRequest *request)
-  {
-    int params = request->params();
-    bool update;
-    update = false;
-    uint16_t yr, mo, da, ho, mi;
-    yr = mo = da = ho = mi = -1;
-    for(int i=0;i<params;i++)
-    {
-      AsyncWebParameter* p = request->getParam(i);
-      if(p->isPost())
-      {
-        update = true;
-        if (p->name() == "year") yr = p->value().toInt();
-        if (p->name() == "month") mo = p->value().toInt();
-        if (p->name() == "day") da = p->value().toInt();
-        if (p->name() == "hour") ho = p->value().toInt();
-        if (p->name() == "minute") mi = p->value().toInt();
-      }
-    }
-    if (update && yr != -1 && mo != -1 && da != -1 && ho != -1 && mi != -1)
-    {
-      rtc.setTime(0, mi, ho, da, mo, yr);
-    }
-    request->send_P(200, "text/html", time_htm); 
-  });
-
-  webServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request) 
-  {
-    if (request->hasParam("restart"))
-    {
-      if (request->getParam("restart")->value().toInt() == 1) Serial1.write("x");
-    }
-    if (request->hasParam("stop"))
-    {
-      if (request->getParam("stop")->value().toInt() == 1) Serial1.write("z");
-    }
-    request->send_P(200, "text/html", index_htm, processorN42); 
-  });
-  webServer.on("/hist.json", HTTP_GET, [](AsyncWebServerRequest *request) { request->send_P(200, "application/json", hist_json, processorHist); });
-  webServer.begin();
-}
-
-#define XBUTTON_A  16
-#define XBUTTON_B  65
-#define XBUTTON_C  112
-
-void drawMarkers(bool A, bool B, bool C, bool exitApp)
-{
-  if (A) u8g2.drawTriangle(XBUTTON_A, 32, XBUTTON_A - 10, 26, XBUTTON_A + 10, 26);
-  if (B) u8g2.drawTriangle(XBUTTON_B, 32, XBUTTON_B - 10, 26, XBUTTON_B + 10, 26);
-  if (C) u8g2.drawTriangle(XBUTTON_C, 32, XBUTTON_C - 10, 26, XBUTTON_C + 10, 26);
-  if (exitApp)
-  {
-    u8g2.setFont(u8g2_font_ncenB08_tr);
-    u8g2.drawStr(XBUTTON_A - 12, 10, "Exit");
-    u8g2.drawStr(XBUTTON_A - 10, 20, "app");
-  }
-}
-
-// Needs to be made app-context aware
-void showContextHelp()
-{
-  switch (displayMode)
-  {
-    case DISPLAY_MAIN:
-      u8g2.clearBuffer();
-      u8g2.setFont(u8g2_font_ncenB08_tr);
-      u8g2.drawStr(XBUTTON_A - 15, 10, "Prev.");
-      u8g2.drawStr(XBUTTON_A - 10, 20, "app");
-
-      u8g2.drawStr(XBUTTON_B - 12, 10, "Start");
-      u8g2.drawStr(XBUTTON_B - 10, 20, "app");
-
-      u8g2.drawStr(XBUTTON_C - 15, 10, "Next");
-      u8g2.drawStr(XBUTTON_C - 10, 20, "app");
-      drawMarkers(true, true, true, false);
-      u8g2.sendBuffer();
-      break;
-    case DISPLAY_SP:
-      u8g2.clearBuffer();
-      u8g2.setFont(u8g2_font_ncenB08_tr);
-
-      u8g2.drawStr(XBUTTON_B - 25, 10, "Log/Lin");
-      u8g2.drawStr(XBUTTON_B - 17, 20, "toggle");
-
-      u8g2.drawStr(XBUTTON_C - 20, 10, "Clear");
-      u8g2.drawStr(XBUTTON_C - 30, 20, "spectrum");
-      drawMarkers(true, true, true, true);
-      u8g2.sendBuffer();
-      break;
-    case DISPLAY_CPM:
-      u8g2.clearBuffer();
-      drawMarkers(true, false, false, true);
-      u8g2.sendBuffer();
-      break;
-    case DISPLAY_USV:
-      u8g2.clearBuffer();
-      drawMarkers(true, false, false, true);
-      u8g2.sendBuffer();
-      break;
-    case DISPLAY_WIFI:
-      u8g2.clearBuffer();
-      u8g2.setFont(u8g2_font_ncenB08_tr);
-      u8g2.drawStr(XBUTTON_B - 25, 10, "Connect");
-      u8g2.drawStr(XBUTTON_B - 25, 20, "to WiFi");
-
-      u8g2.drawStr(XBUTTON_C - 19, 10, "Start");
-      u8g2.drawStr(XBUTTON_C - 25, 20, "hotspot");
-
-      drawMarkers(true, true, true, true);
-      u8g2.sendBuffer();
-      break;
-    case DISPLAY_WIFI_QR:
-      u8g2.clearBuffer();
-      u8g2.setFont(u8g2_font_ncenB08_tr);
-      u8g2.drawStr(XBUTTON_B - 15, 10, "Toggle");
-      u8g2.drawStr(XBUTTON_B - 17, 20, "QR/text");
-      drawMarkers(true, true, false, true);
-      u8g2.sendBuffer();
-      break;
-    case DISPLAY_POWER:
-      u8g2.clearBuffer();
-      u8g2.setFont(u8g2_font_ncenB08_tr);
-      u8g2.drawStr(XBUTTON_B - 20, 10, "Power");
-      u8g2.drawStr(XBUTTON_B - 8, 20, "off");
-      u8g2.drawStr(XBUTTON_C - 13, 20, "Sleep");
-      drawMarkers(true, true, true, true);
-      u8g2.sendBuffer();
-      break;
-    case DISPLAY_LOG_GPS:
-      u8g2.clearBuffer();
-      u8g2.setFont(u8g2_font_ncenB08_tr);
-      drawMarkers(true, true, true, true);
-      u8g2.sendBuffer();
-      break;
-    case DISPLAY_LOG:
-      u8g2.clearBuffer();
-      u8g2.setFont(u8g2_font_ncenB08_tr);
-      u8g2.drawStr(XBUTTON_C - 23, 10, "Mount");
-      u8g2.drawStr(XBUTTON_C - 26, 20, "SD card");
-      drawMarkers(true, false, true, true);
-      u8g2.sendBuffer();
-      break;
-  }
-}
-
-
-float vbat_read()
-{
-  float adcVal;
-
-  pinMode(2, INPUT);
-  digitalWrite(MEAS, LOW);
-  delay(100);
-  adcVal = analogRead(2)*0.0049;
-  digitalWrite(MEAS, HIGH);
-  pinMode(2, OUTPUT);
-  digitalWrite(2, LOW);
-  return adcVal;
-}
-
-
-void loop()
-{
-  static bool clicks = false;
-  static bool backlight = false;
-  static uint16_t bufIdx = 0;
-  static uint16_t i;
-  static uint8_t rxChar;
-  static uint8_t menuSelection = DISPLAY_POWER;
-  static bool showHelp = false;
-  static float vbat;
-
-  buttonA.update();
-  buttonB.update();
-  buttonC.update();
-
-  // Context independent, button B long press always toggles backlight
-  if (pressed_BUT2_B_long)
-  {
-    pressed_BUT2_B_long = false;
-    backlight = !backlight;
-    if (backlight) digitalWrite(BACKLIGHT, HIGH);
-    else digitalWrite(BACKLIGHT, LOW);
-  }
-
-  // Context independent, button C long press always toggles clicks
-  if (pressed_BUT3_C_long)
-  {
-    pressed_BUT3_C_long = false;
-    if (clicks) Serial1.write("o0\n");
-    else Serial1.write("o1\n");
-    clicks = false;
-    delay(200);
-    while(Serial1.available()) Serial1.read();  // Consume response, hopefully including any spurious 0xFF that would turn clicks back on
-  }
-
-  tNow = millis();
-
-  if (pressed_BUT1_A_long || showHelp)
-  {
-    if (pressed_BUT1_A_long)
-    {
-      // Initial long press. Display immediately
-      tDisplay = tNow;
-      // Clear long press flag
-      pressed_BUT1_A_long = false;
-      // Switch to showHelp flag
-      showHelp = true;
-    }
-
-    if (tNow >= tDisplay)
-    {
-      tDisplay += 1000;
-      showContextHelp();
-    }
-
-    if (buttonA.read() == false)
-    {
-      // Button released, stop showing help screen.
-      showHelp = false;
-      
-      // Also make sure any buttons fatfingered during
-      // help screen don't start messing things up.
-      pressed_BUT1_A = false;
-      pressed_BUT2_B = false;
-      pressed_BUT3_C = false;
-      pressed_BUT1_A_long = false;
-      pressed_BUT2_B_long = false;
-      pressed_BUT3_C_long = false;
-      tDisplay = tNow;
-    }
-  }
-  else
-  {
-    switch (displayMode)
-    {
-      case DISPLAY_MAIN:
-        if (tNow >= tDisplay)
-        {
-          tDisplay += 1000;
-          u8g2.clearBuffer();
-          switch (menuSelection)
-          {
-            case DISPLAY_SP:
-              u8g2.setFont(u8g2_font_logisoso16_tf);
-              sprintf(buf, "Spectrum");
-              i = u8g2.getStrWidth(buf);
-              u8g2.drawStr(64 - (16 + 4 + i)/2 + 16 + 4, 24, buf);
-              u8g2.setFont(u8g2_font_open_iconic_all_2x_t);
-              u8g2.drawStr(64 - (16 + 4 + i)/2, 24, "\x58");
-              break;
-            case DISPLAY_CPM:
-              u8g2.setFont(u8g2_font_logisoso16_tf);
-              sprintf(buf, "Geiger");
-              i = u8g2.getStrWidth(buf);
-              u8g2.drawStr(64 - (16 + 4 + i)/2 + 16 + 4, 24, buf);
-              u8g2.setFont(u8g2_font_open_iconic_all_2x_t);
-              u8g2.drawStr(64 - (16 + 4 + i)/2, 24, "\x8D");
-              break;
-            case DISPLAY_USV:
-              u8g2.setFont(u8g2_font_logisoso16_tf);
-              sprintf(buf, "uSv/h");
-              i = u8g2.getStrWidth(buf);
-              u8g2.drawStr(64 - (16 + 4 + i)/2 + 16 + 4, 24, buf);
-              u8g2.setFont(u8g2_font_open_iconic_all_2x_t);
-              u8g2.drawStr(64 - (16 + 4 + i)/2, 24, "\x64");
-              break;
-            case DISPLAY_WIFI:
-              u8g2.setFont(u8g2_font_logisoso16_tf);
-              sprintf(buf, "WiFi");
-              i = u8g2.getStrWidth(buf);
-              u8g2.drawStr(64 - (16 + 4 + i)/2 + 16 + 4, 24, buf);
-              u8g2.setFont(u8g2_font_open_iconic_all_2x_t);
-              u8g2.drawStr(64 - (16 + 4 + i)/2, 24, "\xF7");
-              break;
-            case DISPLAY_POWER:
-              u8g2.setFont(u8g2_font_logisoso16_tf);
-              sprintf(buf, "Power");
-              i = u8g2.getStrWidth(buf);
-              u8g2.drawStr(64 - (16 + 4 + i)/2 + 16 + 4, 24, buf);
-              u8g2.setFont(u8g2_font_open_iconic_all_2x_t);
-              u8g2.drawStr(64 - (16 + 4 + i)/2, 24, "\xEB");
-              break;
-            case DISPLAY_LOG:
-              u8g2.setFont(u8g2_font_logisoso16_tf);
-              sprintf(buf, "SD Log");
-              i = u8g2.getStrWidth(buf);
-              u8g2.drawStr(64 - (16 + 4 + i)/2 + 16 + 4, 24, buf);
-              u8g2.setFont(u8g2_font_open_iconic_all_2x_t);
-              u8g2.drawStr(64 - (16 + 4 + i)/2, 24, "\x80");
-              break;
-          }
-          u8g2.drawTriangle(0, 15, 10, 0, 10, 30);
-          u8g2.drawTriangle(127, 15, 117, 0, 117, 30);
-          u8g2.sendBuffer();
-        }
-        break;
-      case DISPLAY_SP:
-        if (tNow >= tDisplay)
-        {
-          tDisplay += 1000;
-          Serial1.write("h");
-        }
-        break;
-      case DISPLAY_CPM:
-        if (tNow >= tDisplay)
-        {
-          tDisplay += 1000;
-          //delay(500);    // perfectly ok
-          Serial1.write("m");
-        }
-        break;
-      case DISPLAY_USV:
-        if (tNow >= tDisplay)
-        {
-          tDisplay += 1000;
-          //zest_lightsleep(500);   // messes things up. Whaa?
-          Serial1.write("m");
-        }
-        break;
-      case DISPLAY_WIFI:
-        if (tNow >= tDisplay)
-        {
-          tDisplay += 1000;
-          if (wifiOk)
-          {
-            u8g2.clearBuffer();
-            u8g2.setFont(u8g2_font_ncenB08_tr);
-            if (wifiAP)
-            {
-              sprintf(buf, "P-%02X%02X, pomelopw", baseMac[4], baseMac[5]);
-              u8g2.drawStr(0,10,buf);
-            }
-            else
-            {
-              sprintf(buf, "Joined SSID: %s", wifi_ssid);
-              u8g2.drawStr(0,10,buf);
-            }
-            sprintf(buf, "http://%s", wifi_IP.toString().c_str());
-            u8g2.drawStr(0,20,buf);
-            u8g2.drawStr(57,30,"QR");
-            u8g2.sendBuffer();
-            Serial1.write("h");
-          }
-          else
-          {
-            u8g2.clearBuffer();
-            u8g2.setFont(u8g2_font_ncenB08_tr);
-            u8g2.drawStr(0,10,"WiFi not connected");
-            u8g2.drawStr(100,20,"Hot");
-            u8g2.drawStr(98,30,"spot");
-            if (wifi_ssid != "")
-            {
-              u8g2.drawLine(95, 11, 95, 32);
-              u8g2.drawStr(93 - u8g2.getStrWidth(wifi_ssid.c_str()),20,wifi_ssid.c_str());
-              u8g2.drawStr(48,30,"Connect");
-            }
-            u8g2.sendBuffer();
-          }
-        }
-        break;
-      case DISPLAY_WIFI_QR:
-        if (tNow >= tDisplay)
-        {
-          tDisplay += 1000;
-          if (wifiOk)
-          {
-            QRCode qrcode;
-            uint8_t qrcodeBytes[qrcode_getBufferSize(3)];
-
-            u8g2.clearBuffer();
-            u8g2.setFont(u8g2_font_ncenB08_tr);
-
-            if (wifiAP)
-            {
-              u8g2.drawStr(33,10,"WiFi");
-              u8g2.drawStr(33,20,"<---");
-              sprintf(buf, "WIFI:S:P-%02X%02X;T:WPA;P:pomelopw;;", baseMac[4], baseMac[5]);
-              qrcode_initText(&qrcode, qrcodeBytes, 3, ECC_QUARTILE, buf);
-              for (uint8_t y = 0; y < qrcode.size; y++) {
-                for (uint8_t x = 0; x < qrcode.size; x++) {
-                  if (qrcode_getModule(&qrcode, x, y)) u8g2.drawPixel(x + 1, y + 1);
-                }
-              }
-            }
-
-            u8g2.drawStr(76,10,"  UI");
-            u8g2.drawStr(76,20,"--->");
-            
-            u8g2.drawStr(50,30,"Text");
-
-            sprintf(buf, "HTTP://%s", wifi_IP.toString().c_str());
-            qrcode_initText(&qrcode, qrcodeBytes, 3, ECC_HIGH, buf);
-
-            for (uint8_t y = 0; y < qrcode.size; y++) {
-              for (uint8_t x = 0; x < qrcode.size; x++) {
-                if (qrcode_getModule(&qrcode, x, y)) u8g2.drawPixel(x + 98, y + 1);
-              }
-            }
-
-            u8g2.sendBuffer();
-            Serial1.write("h");
-          }
-          else
-          {
-            u8g2.clearBuffer();
-            u8g2.setFont(u8g2_font_ncenB08_tr);
-            u8g2.drawStr(0,10,"WiFi not connected");
-            u8g2.drawStr(0,20,"No QR codes to show");
-            u8g2.drawStr(40,30,"Text");
-            u8g2.sendBuffer();
-          }
-        }
-        break;
-      case DISPLAY_POWER:
-        if (tNow >= tDisplay)
-        {
-          tDisplay += 1000;
-          vbat = vbat_read();
-          u8g2.clearBuffer();
-          u8g2.setFont(u8g2_font_ncenB08_tr);
-          u8g2.drawStr(0, 10, rtc.getTime("%Y.%m.%d").c_str());
-          u8g2.drawStr(0, 20, rtc.getTime("%H:%M:%S").c_str());
-          sprintf(buf, "Bat: %.2f V", vbat);
-          u8g2.drawStr(64, 10, buf);
-
-          u8g2.drawStr(45, 30,"Pw Off");
-          u8g2.drawStr(95,30,"Sleep");
-          u8g2.sendBuffer();
-        }
-        break;
-      case DISPLAY_LOG_GPS:
-        if (tNow >= tDisplay)
-        {
-          tDisplay += 1000;
-          u8g2.clearBuffer();
-          u8g2.setFont(u8g2_font_ncenB08_tr);
-          sprintf(buf, "%02d:%02d %.3f,%.3f", GPS.hour, GPS.minute, GPS.latitudeDegrees, GPS.longitudeDegrees);
-          u8g2.drawStr(0,10, buf);
-          u8g2.drawStr(0,20,"SD");
-          if (sdOk)
-          {
-            u8g2.drawStr(0,30,"Unmount");
-            u8g2.drawStr(60,20,"Log");
-            if (fileLogging)
-            {
-              u8g2.drawStr(57,30,"Stop");
-            }
-            else
-            {
-              u8g2.drawStr(57,30,"Start");
-            }
-          }
-          else
-          {
-            u8g2.drawStr(0,30,"Mount");
-          }
-          u8g2.sendBuffer();
-        }
-        break;
-      case DISPLAY_LOG:
-        if (sdOk && fileLogging)
-        {
-          if (tNow >= tLog)
-          {
-            // Trigger a log file write
-            tLog += LOGFILE_INTERVAL_S * 1000;
-            Serial1.write("h");
-          }
-        }
-        if (tNow >= tDisplay)
-        {
-          tDisplay += 1000;
-          u8g2.clearBuffer();
-          u8g2.setFont(u8g2_font_ncenB08_tr);
-          sprintf(buf, "RTC: %02d:%02d, F: %08lu", rtc.getHour(true), rtc.getMinute(), logFileNumber);
-          u8g2.drawStr(0,10, buf);
-          sprintf(buf, "L: %03d", logFileEntry);
-          u8g2.drawStr(0,20, buf);
-
-          if (sdOk)
-          {
-            u8g2.drawLine(73, 11, 73, 32);
-            u8g2.drawStr(75,20,"Unmount");
-            u8g2.drawStr(95,30,"SD");
-            u8g2.drawStr(50,20,"Log");
-            if (fileLogging)
-            {
-              u8g2.drawStr(47,30,"Stop");
-            }
-            else
-            {
-              u8g2.drawStr(45,30,"Start");
-            }
-          }
-          else
-          {
-            u8g2.drawStr(90,20,"Mount");
-            u8g2.drawStr(100,30,"SD");
-          }
-          u8g2.sendBuffer();
-        }
-        break;
-    }
-
-    if (pressed_BUT1_A)
-    {
-      pressed_BUT1_A = false;
-      tDisplay = tNow;
-      if (displayMode == DISPLAY_MAIN)
-      {
-        switch (menuSelection)
-        {
-          case DISPLAY_POWER:
-            menuSelection = DISPLAY_CPM;
-            break;
-          case DISPLAY_CPM:
-            menuSelection = DISPLAY_USV;
-            break;
-          case DISPLAY_USV:
-            menuSelection = DISPLAY_SP;
-            break;
-          case DISPLAY_SP:
-            menuSelection = DISPLAY_WIFI;
-            break;
-          case DISPLAY_WIFI:
-            menuSelection = DISPLAY_LOG;
-            break;
-          case DISPLAY_LOG:
-            menuSelection = DISPLAY_POWER;
-            break;
-        }
-      }
-      else
-      {
-        // This is just "Back"/"app exit" for now
-        displayMode = DISPLAY_MAIN;
-
-        if (wifiOk)
-        {
-          webServer.end();
-          if (wifiAP)
-          {
-            WiFi.softAPdisconnect(true); 
-          }
-          else
-          {
-            WiFi.disconnect(true, false, 0);
-          }
-          wifiOk = false;
-          wifiAP = false;
-        }
-
-        if (sdOk)
-        {
-            if (fileLogging)
-            {
-              logFile.close();
-              fileLogging = false;
-            }
-            SD.end();
-            sdOk = false;
-        }
-      }
-    }
-
-    if (pressed_BUT2_B)
-    {
-      pressed_BUT2_B = false;
-      if (displayMode == DISPLAY_MAIN)
-      {
-        // Switch to that application
-        displayMode = menuSelection;
-        tDisplay = tNow;
-        switch (displayMode)
-        {
-          case DISPLAY_POWER:
-            Serial1.write("o0\n");
-            break;
-          case DISPLAY_CPM:
-            Serial1.write("o0\n");
-            euroFilterMinCutoff = 0.002670;
-            euroFilterBeta = 0.0000153;
-            delete euroFilter;
-            euroFilter = new OneEuroFilter(euroFilterFreq, euroFilterMinCutoff, euroFilterBeta);
-            for (i = 0; i < HIST_LEN; i++)
-            {
-              bufHistory[i] = 0;
-            }
-            break;
-          case DISPLAY_USV:
-            Serial1.write("o0\n");
-            euroFilterMinCutoff = 0.010515;
-            euroFilterBeta = 0.042970;
-            delete euroFilter;
-            euroFilter = new OneEuroFilter(euroFilterFreq, euroFilterMinCutoff, euroFilterBeta);
-            for (i = 0; i < HIST_LEN; i++)
-            {
-              bufHistory[i] = 0;
-            }
-            break;
-          case DISPLAY_SP:
-            Serial1.write("o0\n");
-            break;
-          case DISPLAY_WIFI:
-            Serial1.write("o0\n");
-            break;
-          case DISPLAY_LOG:
-            Serial1.write("o0\n");
-            tLog = tNow;
-            break;
-        }
-      }
-      else if (displayMode == DISPLAY_SP)
-      {
-        // log toggle
-        spectrumLog = !spectrumLog;
-        tDisplay = tNow;
-      }
-      else if (displayMode == DISPLAY_WIFI)
-      {
-        if (wifiOk == false)
-        {
-          if (wifi_ssid != "")
-          {
-            WiFi.mode(WIFI_STA);
-            WiFi.begin(wifi_ssid, wifi_pass);
-            for (i = 0; i < 10; i++)
-            {
-              u8g2.clearBuffer();
-              u8g2.setFont(u8g2_font_ncenB08_tr);
-              u8g2.drawStr(10,10, "Connection attempt");
-              sprintf(buf, "%d/10", i);
-              u8g2.drawStr(55,20, buf);
-              u8g2.sendBuffer();
-
-              if (WiFi.status() == WL_CONNECTED)
-              {
-                break;
-              }
-              delay(300);
-            }
-
-            u8g2.clearBuffer();
-            u8g2.setFont(u8g2_font_ncenB08_tr);
-            if (WiFi.status() == WL_CONNECTED)
-            {
-              wifi_IP = WiFi.localIP();
-              startServer();
-              wifiOk = true;
-              wifiAP = false;
-              u8g2.drawStr(0,10, "Connected to network");
-            }
-            else
-            {
-              WiFi.disconnect(true, false, 0);
-              u8g2.drawStr(0,10, "Connection failed");
-            }
-            u8g2.sendBuffer();
-            delay(500);
-          }
-        }
-        else
-        {
-          displayMode = DISPLAY_WIFI_QR;
-          Serial1.write("o0\n");
-        }
-      }
-      else if (displayMode == DISPLAY_WIFI_QR)
-      {
-        displayMode = DISPLAY_WIFI;
-        Serial1.write("o0\n");
-      }
-      else if ((displayMode == DISPLAY_LOG_GPS) || (displayMode == DISPLAY_LOG))
-      {
-        if (sdOk)
-        {
-          if (fileLogging)
-          {
-            // Stop logging
-            u8g2.clearBuffer();
-            u8g2.setFont(u8g2_font_ncenB08_tr);
-            logFile.close();
-            fileLogging = false;
-            u8g2.drawStr(0,10,"STOP LOGGING");
-            u8g2.sendBuffer();
-            delay(500);
-          }
-          else
-          {
-            // Start logging
-            u8g2.clearBuffer();
-            u8g2.setFont(u8g2_font_ncenB08_tr);
-            // Find first unused directory
-            for (logFileNumber = 0; logFileNumber < 0xFFFFFFFF; logFileNumber++)
-            {
-              sprintf(logDir, "/%08lu", logFileNumber);
-              if (!SD.exists(logDir)) break;
-            }
-            if (SD.mkdir(logDir))
-            {
-              logFileNumber = 0;
-              logFileEntry = 0;
-              sprintf(buf, "/%s/%08lu.csv", logDir, logFileNumber);
-              logFile = SD.open(buf, FILE_WRITE);
-              if (logFile)
-              {
-                u8g2.drawStr(0,10,"START LOGGING");
-                fileLogging = true;
-              }
-              else
-              {
-                u8g2.drawStr(0,10,"Cannot create file");
-              }
-            }
-            else
-            {
-              u8g2.drawStr(0,10,"Cannot create dir");
-            }
-            u8g2.sendBuffer();
-            delay(500);
-          }
-        }
-      }
-      else if (displayMode == DISPLAY_POWER)
-      {
-        // Power off
-        core_shutdown = true;
-        Serial1.write("z");
-        zest_deepsleep();
-      }
-    }
-
-    if (pressed_BUT3_C)
-    {
-      pressed_BUT3_C = false;
-      if (displayMode == DISPLAY_MAIN)
-      {
-        tDisplay = tNow;
-        switch (menuSelection)
-        {
-          case DISPLAY_POWER:
-            menuSelection = DISPLAY_LOG;
-            break;
-          case DISPLAY_CPM:
-            menuSelection = DISPLAY_POWER;
-            break;
-          case DISPLAY_USV:
-            menuSelection = DISPLAY_CPM;
-            break;
-          case DISPLAY_SP:
-            menuSelection = DISPLAY_USV;
-            break;
-          case DISPLAY_WIFI:
-            menuSelection = DISPLAY_SP;
-            break;
-          case DISPLAY_LOG:
-            menuSelection = DISPLAY_WIFI;
-            break;
-        }
-      }
-      else if (displayMode == DISPLAY_POWER)
-      {
-        // Sleep
-        core_shutdown = false;
-        zest_deepsleep();
-      }
-      else if (displayMode == DISPLAY_SP)
-      {
-        Serial1.write("x");
-      }
-      else if (displayMode == DISPLAY_WIFI)
-      {
-        if (wifiOk == false)
-        {
-          WiFi.mode(WIFI_AP);
-          Network.macAddress(baseMac);
-          sprintf(buf, "P-%02X%02X", baseMac[4], baseMac[5]);
-          WiFi.softAP(buf, "pomelopw");
-          wifi_IP = WiFi.softAPIP();
-          startServer();
-          wifiOk = true;
-          wifiAP = true;
-          tDisplay = tNow;
-        }
-      }
-      else if ((displayMode == DISPLAY_LOG_GPS) || (displayMode == DISPLAY_LOG))
-      {
-        if (sdOk)
-        {
-            if (fileLogging)
-            {
-              logFile.close();
-              fileLogging = false;
-            }
-            SD.end();
-            sdOk = false;
-        }
-        else
-        {
-          u8g2.clearBuffer();
-          u8g2.setFont(u8g2_font_ncenB08_tr);
-          if(SD.begin())
-          {
-            u8g2.drawStr(0,10,"SD card OK");
-            sdOk = true;
-            fileLogging = false;
-          }
-          else
-          {
-            u8g2.drawStr(0,10,"SD card failed");
-            sdOk = false;
-            fileLogging = false;
-          }
-          u8g2.sendBuffer();
-          delay(500);
-        }
-      }
-    }
-  }
-
-  while (GPS.read() != 0) ;
-  if (GPS.newNMEAreceived())
-  {
-    GPS.parse(GPS.lastNMEA());
-    if (sdOk && fileLogging)
-    {
-      // Trigger spectrum readout just on GGA sentence
-      if (strncmp(GPS.lastNMEA(), "$GNGGA", 6) == 0) Serial1.write("h");
-    }
-  }
-
-  if (Serial && (Serial.available()))
-  {
-    rxChar = Serial.read();
-    switch (rxChar)
-    {
-      case 'd':
-        euroFilterMinCutoff += 0.000001;
-        sprintf(buf, "fcmin = %.7f, beta = %.7f\n", euroFilterMinCutoff, euroFilterBeta);
-        usbWrite(buf);
-        delete euroFilter;
-        euroFilter = new OneEuroFilter(euroFilterFreq, euroFilterMinCutoff, euroFilterBeta);
-        break;
-      case 'c':
-        euroFilterMinCutoff -= 0.000001;
-        sprintf(buf, "fcmin = %.7f, beta = %.7f\n", euroFilterMinCutoff, euroFilterBeta);
-        usbWrite(buf);
-        delete euroFilter;
-        euroFilter = new OneEuroFilter(euroFilterFreq, euroFilterMinCutoff, euroFilterBeta);
-        break;
-      /*
-      case 'f':
-        euroFilterFreq += 1;
-        sprintf(buf, "euroFilterFreq = %.2f\n", euroFilterFreq);
-        usbWrite(buf);
-        delete euroFilter;
-        euroFilter = new OneEuroFilter(euroFilterFreq, euroFilterMinCutoff, euroFilterBeta);
-        break;
-      case 'v':
-        euroFilterFreq -= 1;
-        sprintf(buf, "euroFilterFreq = %.2f\n", euroFilterFreq);
-        usbWrite(buf);
-        delete euroFilter;
-        euroFilter = new OneEuroFilter(euroFilterFreq, euroFilterMinCutoff, euroFilterBeta);
-        break;
-      */
-      case 'g':
-        euroFilterBeta += 0.000001;
-        sprintf(buf, "fcmin = %.7f, beta = %.7f\n", euroFilterMinCutoff, euroFilterBeta);
-        usbWrite(buf);
-        delete euroFilter;
-        euroFilter = new OneEuroFilter(euroFilterFreq, euroFilterMinCutoff, euroFilterBeta);
-        break;
-      case 'b':
-        euroFilterBeta -= 0.000001;
-        sprintf(buf, "fcmin = %.7f, beta = %.7f\n", euroFilterMinCutoff, euroFilterBeta);
-        usbWrite(buf);
-        delete euroFilter;
-        euroFilter = new OneEuroFilter(euroFilterFreq, euroFilterMinCutoff, euroFilterBeta);
-        break;
-    }
-  }
-
-  if (Serial1.available())
-  {
-    while (Serial1.available())
-    {
-      rxChar = Serial1.read();
-      if (rxChar == 0xFF)
-      {
-        tone(BUZZER, 4000, 2);
-        clicks = true;
-      }
-      else
-      {
-        if (rxChar == '\n')
-        {
-          buf[bufIdx] = 0;
-          parseData(buf);
-          bufIdx = 0;
-        }
-        else
-        {
-          buf[bufIdx] = rxChar;
-          if (bufIdx < sizeof(buf))
-          {
-            bufIdx++;
-          }
-          else
-          {
-            bufIdx = 0;
-          }
-        }
-      }
-    }
+    MDNS.end();
+    wifi_mdns = false;
   }
 }

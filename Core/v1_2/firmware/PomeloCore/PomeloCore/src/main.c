@@ -12,15 +12,16 @@
 #define DBL_TAP_MAGIC 0xf01669ef // Randomly selected, adjusted to have first and last bit set
 #define SPECTRUM_LEN		1024
 #define LIST_FIFO_LEN		128
-#define SERIAL_RX_BUF		128
+#define UART_BUFFER_LEN		128
 
 // bit numbers
-#define LIST_UART_PULSE		0
-#define LIST_UART_ENERGY	1
-#define LIST_UART_ENERGY_TS	2
-#define LIST_USB_PULSE		3
-#define LIST_USB_ENERGY		4
-#define LIST_USB_ENERGY_TS	5
+#define LIST_UART_PULSE			0
+#define LIST_UART_FAST_PULSE	1
+#define LIST_UART_ENERGY		2
+#define LIST_UART_ENERGY_TS		3
+#define LIST_USB_PULSE			4
+#define LIST_USB_ENERGY			5
+#define LIST_USB_ENERGY_TS		6
 
 typedef enum _UsbState_t
 {
@@ -38,6 +39,7 @@ static struct adc_module adc_instance_app;
 static struct dac_module dac_instance_app;
 static struct rtc_module rtc_instance_app;
 struct spi_module spi_instance_app;
+static struct i2c_master_module i2c_instance_app;
 static struct tc_module tc_instance_app;
 
 volatile static uint32_t gammaTime;
@@ -55,6 +57,7 @@ volatile static uint32_t gammaFifoTs[LIST_FIFO_LEN];
 volatile static uint16_t gammaFifoHead, gammaFifoTail;
 volatile static bool gammaCoincidence;
 volatile static bool gammaSyncTrig;
+volatile static uint8_t gammaPulseChar;
 
 volatile static uint8_t listOut;
 volatile static bool temp_comp_run;
@@ -66,10 +69,8 @@ static CmdState_t cmdState;
 
 
 static struct usart_module app_uart_module;
-static uint8_t uart_rx_buf[SERIAL_RX_BUF];
-static uint8_t uart_rx_buf_head;
-static uint8_t uart_rx_buf_tail;
-static uint8_t uart_rx_count;
+static volatile uint8_t rxBufHead, rxBufTail;
+static volatile uint8_t rxBuf[UART_BUFFER_LEN];
 
 
 static void reset_to_bootloader(void);
@@ -79,63 +80,26 @@ int pomelo_sprintf(uint8_t iFace, const char * format, ... );
 
 void USART_ISR_VECT(uint8_t instance)
 {
-	static uint8_t temp;
-	usart_serial_read_packet(&app_uart_module, &temp, 1);
-	cpu_irq_disable();
+	static uint16_t data;
+	usart_read_wait(&app_uart_module, &data);
 
-	uart_rx_buf[uart_rx_buf_tail] = temp;
-
-	if ((SERIAL_RX_BUF - 1) == uart_rx_buf_tail) {
-		uart_rx_buf_tail = 0x00;
-		} else {
-		uart_rx_buf_tail++;
+	if (rxBufHead != rxBufTail)
+	{
+		rxBuf[rxBufHead] = (uint8_t)data;
+		rxBufHead = (rxBufHead + 1) % UART_BUFFER_LEN;
 	}
-	
-	cpu_irq_enable();
 }
 
-uint8_t uart_rx(uint8_t *data, uint8_t max_length)
+bool uart_available()
 {
-	uint8_t data_received = 0;
-	if(uart_rx_buf_tail >= uart_rx_buf_head)
-	{
-		uart_rx_count = uart_rx_buf_tail - uart_rx_buf_head;
-	}
-	else
-	{
-		uart_rx_count = uart_rx_buf_tail + (SERIAL_RX_BUF - uart_rx_buf_head);
-	}
-	
-	if (0 == uart_rx_count) {
-		return 0;
-	}
+	if ((rxBufTail + 1) % UART_BUFFER_LEN != rxBufHead) return true;
+	else return false;
+}
 
-	if (SERIAL_RX_BUF <= uart_rx_count) {
-		uart_rx_buf_head = uart_rx_buf_tail;
-		uart_rx_count = SERIAL_RX_BUF;
-		if (SERIAL_RX_BUF <= max_length) {
-			max_length = SERIAL_RX_BUF;
-		}
-		} else {
-		if (max_length > uart_rx_count) {
-			max_length = uart_rx_count;
-		}
-	}
-
-	data_received = max_length;
-	while (max_length > 0) {
-		*data = uart_rx_buf[uart_rx_buf_head];
-		data++;
-		max_length--;
-		if ((SERIAL_RX_BUF - 1) == uart_rx_buf_head) {
-			uart_rx_buf_head = 0;
-		}
-		else
-		{
-			uart_rx_buf_head++;
-		}
-	}
-	return data_received;
+uint8_t uart_rx()
+{
+	rxBufTail = (rxBufTail + 1) % UART_BUFFER_LEN;
+	return rxBuf[rxBufTail];
 }
 
 uint8_t uart_tx(uint8_t *data, uint8_t length)
@@ -167,6 +131,8 @@ void uart_init()
 	usart_enable_transceiver(&app_uart_module, USART_TRANSCEIVER_TX);
 	usart_enable_transceiver(&app_uart_module, USART_TRANSCEIVER_RX);
 
+	rxBufHead = 1;
+	rxBufTail = 0;
 	_sercom_set_handler(2, USART_ISR_VECT);
 	SERCOM2->USART.INTENSET.reg = SERCOM_USART_INTFLAG_RXC;
 	system_interrupt_enable(SYSTEM_INTERRUPT_MODULE_SERCOM2);
@@ -288,7 +254,14 @@ static void trigger_callback(void)
 			{
 				if (listOut != 0)
 				{
-					if (gammaFifoHead != gammaFifoTail)
+					// By now we're committed to suboptimal timing in our ISR,
+					// so maybe we go all in and send the UART click pulse
+					// directly
+					if ((listOut & (1<<LIST_UART_FAST_PULSE)) != 0)
+					{
+						uart_tx(&gammaPulseChar, 1);
+					}
+					else if (gammaFifoHead != gammaFifoTail)
 					{
 						l_gammaTime = gammaTime + tc_get_count_value(&tc_instance_app);
 
@@ -576,7 +549,8 @@ static void dac_init_gamma_hv(void)
 }
 
 
-static void spi_init_tmp(void)
+// ---------- SPI ----------------------
+static void temp_init(void)
 {
 	uint16_t rx_data;
 	struct spi_config config;
@@ -635,6 +609,141 @@ static float read_temp(void)
 	return ((float)rx_data_0 * 0.03125);
 }
 
+
+/*
+// ---------- I2C ----------------------
+static void temp_init(void)
+{
+	enum status_code status;
+	struct i2c_master_config config_i2c_master;
+	uint8_t i2c_buffer[3];
+	struct i2c_master_packet master_packet = {
+		.address     = 0x49,
+		.data_length = 3,
+		.data        = &i2c_buffer,
+		.ten_bit_address = false,
+		.high_speed      = false,
+		.hs_master_code  = 0x0,
+	};
+
+	i2c_master_get_config_defaults(&config_i2c_master);
+	config_i2c_master.buffer_timeout = 100;
+	config_i2c_master.pinmux_pad0    = PINMUX_PA16C_SERCOM1_PAD0;
+	config_i2c_master.pinmux_pad1    = PINMUX_PA17C_SERCOM1_PAD1;
+	config_i2c_master.run_in_standby = 0;
+	status = i2c_master_init(&i2c_instance_app, SERCOM1, &config_i2c_master);
+	i2c_master_enable(&i2c_instance_app);
+
+	master_packet.data_length = 1;
+	i2c_buffer[0] = 0; // temperature register
+	status = i2c_master_write_packet_wait(&i2c_instance_app, &master_packet);
+
+	status = i2c_master_read_packet_wait(&i2c_instance_app, &master_packet);
+
+	if (STATUS_OK == status)
+	{
+		master_packet.data_length = 3;
+		i2c_buffer[0] = 1; // write to conf register @ addr. 1. Active, 0.25 Hz
+		i2c_buffer[1] = 0x60;
+		i2c_buffer[2] = 0x20;
+		status = i2c_master_write_packet_wait(&i2c_instance_app, &master_packet);
+
+		master_packet.data_length = 1;
+		i2c_buffer[0] = 0; // Switch pointer to temperature register
+		status = i2c_master_write_packet_wait(&i2c_instance_app, &master_packet);
+	}
+}
+
+
+static float read_temp(void)
+{
+	enum status_code status;
+	uint8_t i2c_buffer[3];
+	int16_t output;
+	struct i2c_master_packet master_packet = {
+		.address     = 0x49,
+		.data_length = 2,
+		.data        = i2c_buffer,
+		.ten_bit_address = false,
+		.high_speed      = false,
+		.hs_master_code  = 0x0,
+	};
+
+	status = i2c_master_read_packet_wait(&i2c_instance_app, &master_packet);
+	output = (int16_t)((i2c_buffer[0] << 8) | i2c_buffer[1]);
+	output >>= 4;
+
+	return ((int16_t)output)*0.0625;
+}
+*/
+
+/*
+// ---------- I2C TMP451------------------
+static void temp_init(void)
+{
+	enum status_code status;
+	struct i2c_master_config config_i2c_master;
+	uint8_t i2c_buffer[3];
+	struct i2c_master_packet master_packet = {
+		.address     = 0x4C,
+		.data_length = 3,
+		.data        = &i2c_buffer,
+		.ten_bit_address = false,
+		.high_speed      = false,
+		.hs_master_code  = 0x0,
+	};
+
+	i2c_master_get_config_defaults(&config_i2c_master);
+	config_i2c_master.buffer_timeout = 100;
+	config_i2c_master.pinmux_pad0    = PINMUX_PA16C_SERCOM1_PAD0;
+	config_i2c_master.pinmux_pad1    = PINMUX_PA17C_SERCOM1_PAD1;
+	config_i2c_master.run_in_standby = 0;
+	status = i2c_master_init(&i2c_instance_app, SERCOM1, &config_i2c_master);
+	i2c_master_enable(&i2c_instance_app);
+
+	// set range. config.bit2 = 1
+	master_packet.data_length = 2;
+	i2c_buffer[0] = 9; // config write
+	i2c_buffer[1] = 0x84; // MASK1 = 1, continuous conversions, extended range
+	status = i2c_master_write_packet_wait(&i2c_instance_app, &master_packet);
+}
+
+
+static float read_temp(void)
+{
+	enum status_code status;
+	uint8_t i2c_buffer[3];
+	int16_t output;
+	
+	struct i2c_master_packet master_packet = {
+		.address     = 0x4C,
+		.data_length = 1,
+		.data        = i2c_buffer,
+		.ten_bit_address = false,
+		.high_speed      = false,
+		.hs_master_code  = 0x0,
+	};
+
+	master_packet.data_length = 1;
+
+	i2c_buffer[0] = 0; // temp high
+	status = i2c_master_write_packet_wait(&i2c_instance_app, &master_packet);
+	status = i2c_master_read_packet_wait(&i2c_instance_app, &master_packet);
+	output = i2c_buffer[0];
+
+	i2c_buffer[0] = 0x15; // temp low
+	status = i2c_master_write_packet_wait(&i2c_instance_app, &master_packet);
+	status = i2c_master_read_packet_wait(&i2c_instance_app, &master_packet);
+
+	output <<= 4;
+	output |= i2c_buffer[0] >> 4;
+	
+	output -= 64*16;
+
+	return ((int16_t)output)*0.0625;
+}
+*/
+
 static void update_hv_temp()
 {
 	float temp, volts, dacHvValue;
@@ -645,7 +754,7 @@ static void update_hv_temp()
 	if (volts > pomeloParams.sipm_vMax) volts = pomeloParams.sipm_vMax;
 	if (volts < pomeloParams.sipm_vMin) volts = pomeloParams.sipm_vMin;
 	
-	dacHvValue = pomeloParams.vdac_a + pomeloParams.vdac_b*volts;
+	dacHvValue = pomeloParams.vdac[0] + pomeloParams.vdac[1]*volts;
 	if (dacHvValue > 4095) dacHvValue = 4095;
 	if (dacHvValue < 0) dacHvValue = 0;
 	dac_chan_write(&dac_instance_app, DAC_CHANNEL_0, (uint16_t)dacHvValue);
@@ -1127,8 +1236,8 @@ static void load_parameters(void)
 		pomeloParams.sipm_vMax = 4095;
 		pomeloParams.sipm_v0deg = 4095.0;
 		pomeloParams.sipm_vTempComp = 0.0;
-		pomeloParams.vdac_a = 0.0;
-		pomeloParams.vdac_b = 1.0;
+		pomeloParams.vdac[0] = 0.0;
+		pomeloParams.vdac[1] = 1.0;
 		pomeloParams.ecal[0] = 0;
 		pomeloParams.ecal[1] = 0;
 		pomeloParams.ecal[2] = 0;
@@ -1136,6 +1245,7 @@ static void load_parameters(void)
 		pomeloParams.sys_power = false;
 		pomeloParams.sys_outputs = 0;			// There is a variable that this has to be synched up with
 		pomeloParams.sys_coincidence = false;   // There is a variable that this has to be synched up with
+		pomeloParams.sys_pulseChar = 0xFF;
 	}
 }
 
@@ -1148,6 +1258,7 @@ static int8_t save_parameters(void)
 	pomeloParams.sys_coincidence = gammaCoincidence;
 	pomeloParams.sys_outputs = listOut;
 	pomeloParams.sys_power = daq_enabled;
+	pomeloParams.sys_pulseChar = gammaPulseChar;
 	pomeloParams.initialized = 0x55;
 
 	writeBytes = sizeof(pomeloParams);
@@ -1196,7 +1307,7 @@ static int8_t clear_parameters(void)
 }
 
 
-static void param_bootloader(uint8_t iFace, float f, float *dest)
+static void param_bootloader(uint8_t iFace, float f, void *dest)
 {
 	int16_t n;
 	n = (int16_t)f;
@@ -1211,7 +1322,7 @@ static void param_bootloader(uint8_t iFace, float f, float *dest)
 	}
 }
 
-static void param_adc_calib(uint8_t iFace, float f, float *dest)
+static void param_adc_calib(uint8_t iFace, float f, void *dest)
 {
 	int16_t n;
 	n = (int16_t)f;
@@ -1227,7 +1338,21 @@ static void param_adc_calib(uint8_t iFace, float f, float *dest)
 	}
 }
 
-static void param_threshold(uint8_t iFace, float f, float *dest)
+static void param_reboot(uint8_t iFace, float f, void *dest)
+{
+	int16_t n;
+	n = (int16_t)f;
+	if (n == -6666)
+	{
+		NVIC_SystemReset();
+	}
+	else
+	{
+		command_response(iFace, -1);
+	}
+}
+
+static void param_threshold(uint8_t iFace, float f, void *dest)
 {
 	int16_t n;
 	n = (int16_t)f;
@@ -1237,7 +1362,7 @@ static void param_threshold(uint8_t iFace, float f, float *dest)
 	command_response(iFace, 0);
 }
 
-static void param_list_out(uint8_t iFace, float f, float *dest)
+static void param_list_out(uint8_t iFace, float f, void *dest)
 {
 	int16_t n;
 	n = (int16_t)f;
@@ -1249,7 +1374,7 @@ static void param_list_out(uint8_t iFace, float f, float *dest)
 	command_response(iFace, 0);
 }
 
-static void param_coincidence(uint8_t iFace, float f, float *dest)
+static void param_coincidence(uint8_t iFace, float f, void *dest)
 {
 	int16_t n;
 	n = (int16_t)f;
@@ -1260,15 +1385,22 @@ static void param_coincidence(uint8_t iFace, float f, float *dest)
 	command_response(iFace, 0);
 }
 
-static void param_ptr_float(uint8_t iFace, float f, float *dest)
+static void param_ptr_float(uint8_t iFace, float f, void *dest)
 {
-	*dest = f;
+	*((float*)dest) = f;
 	command_response(iFace, 0);
 }
 
-static void param_ptr_float_hv(uint8_t iFace, float f, float *dest)
+static void param_ptr_u8_pulseChar(uint8_t iFace, float f, void *dest)
 {
-	*dest = f;
+	gammaPulseChar = (uint8_t)f;
+	pomeloParams.sys_pulseChar = gammaPulseChar;
+	command_response(iFace, 0);
+}
+
+static void param_ptr_float_hv(uint8_t iFace, float f, void *dest)
+{
+	*((float*)dest) = f;
 	if (daq_enabled) update_hv_temp();
 	command_response(iFace, 0);
 }
@@ -1328,8 +1460,9 @@ static void command_data_handler(uint8_t iFace, uint8_t rxChar)
 	static uint32_t i;
 	static float temp;
 	static uint8_t paramBuf[64];
-	static void (*paramFunc)(uint8_t, float, float*);
-	static float *paramPtr;
+	static char *paramEnd;
+	static void (*paramFunc)(uint8_t, float, void*);
+	static void *paramPtr;
 	static float paramMin, paramMax;
 
 	switch (cmdState)
@@ -1348,6 +1481,14 @@ static void command_data_handler(uint8_t iFace, uint8_t rxChar)
 				case 'a':
 					// Special paramType telling command state to go to adc calib
 					paramFunc = &param_adc_calib;
+					paramMin = -1e6;
+					paramMax = 1e6;
+					cmdState = STATE_CMD_PARAM;
+					count = 0;
+					break;
+				case 'e':
+					// Special paramType telling command state to reboot
+					paramFunc = &param_reboot;
 					paramMin = -1e6;
 					paramMax = 1e6;
 					cmdState = STATE_CMD_PARAM;
@@ -1407,18 +1548,20 @@ static void command_data_handler(uint8_t iFace, uint8_t rxChar)
 					pomelo_sprintf(iFace, "\"vMax\":%f,", pomeloParams.sipm_vMax);
 					pomelo_sprintf(iFace, "\"v0deg\":%f,", pomeloParams.sipm_v0deg);
 					pomelo_sprintf(iFace, "\"vTempComp\":%f},", pomeloParams.sipm_vTempComp);
-					pomelo_sprintf(iFace, "\"vdac\":[%f,%f],", pomeloParams.vdac_a, pomeloParams.vdac_b);
+					pomelo_sprintf(iFace, "\"vdac\":[%f,%f],", pomeloParams.vdac[0], pomeloParams.vdac[1]);
 					pomelo_sprintf(iFace, "\"ecal\":[%8e,%8e,%8e],", pomeloParams.ecal[0], pomeloParams.ecal[1], pomeloParams.ecal[2]);
 					pomelo_sprintf(iFace, "\"threshold\":%d,", pomeloParams.threshold);
 					pomelo_sprintf(iFace, "\"coincidence\":%d,", pomeloParams.sys_coincidence);
-					pomelo_sprintf(iFace, "\"outputs\":{\"uart\":{\"pulse\":%d,\"adc\":%d,\"adcTs\":%d},",
+					pomelo_sprintf(iFace, "\"outputs\":{\"uart\":{\"pulse\":%d,\"fastPulse\":%d,\"adc\":%d,\"adcTs\":%d},",
 						((pomeloParams.sys_outputs >> LIST_UART_PULSE) & 0x01),
+						((pomeloParams.sys_outputs >> LIST_UART_FAST_PULSE) & 0x01),
 						((pomeloParams.sys_outputs >> LIST_UART_ENERGY) & 0x01),
 						((pomeloParams.sys_outputs >> LIST_UART_ENERGY_TS) & 0x01));
-					pomelo_sprintf(iFace, "\"usb\":{\"pulse\":%d,\"adc\":%d,\"adcTs\":%d}}",
+					pomelo_sprintf(iFace, "\"usb\":{\"pulse\":%d,\"adc\":%d,\"adcTs\":%d},",
 						((pomeloParams.sys_outputs >> LIST_USB_PULSE) & 0x01),
 						((pomeloParams.sys_outputs >> LIST_USB_ENERGY) & 0x01),
 						((pomeloParams.sys_outputs >> LIST_USB_ENERGY_TS) & 0x01));
+					pomelo_sprintf(iFace, "\"pulseChar\":%d}", pomeloParams.sys_pulseChar);
 					pomelo_printf(iFace, "}}\n");
 					break;
 				case 'x':
@@ -1437,13 +1580,13 @@ static void command_data_handler(uint8_t iFace, uint8_t rxChar)
 					pomelo_sprintf(iFace, "\t[2] sipm_vMax = %f,\n", pomeloParams.sipm_vMax);
 					pomelo_sprintf(iFace, "\t[3] sipm_v0deg = %f,\n", pomeloParams.sipm_v0deg);
 					pomelo_sprintf(iFace, "\t[4] sipm_vTempComp = %f,\n", pomeloParams.sipm_vTempComp);
-					pomelo_sprintf(iFace, "\t[5] vdac_a = %f,\n", pomeloParams.vdac_a);
-					pomelo_sprintf(iFace, "\t[6] vdac_b = %f,\n", pomeloParams.vdac_b);
+					pomelo_sprintf(iFace, "\t[5-6] vdac[2] = {%f, %f},\n", pomeloParams.vdac[0], pomeloParams.vdac[1]);
 					pomelo_sprintf(iFace, "\t[7-9] ecal[3] = {%f, %f, %f},\n", pomeloParams.ecal[0], pomeloParams.ecal[1], pomeloParams.ecal[2]);
-					pomelo_sprintf(iFace, "\t[T] threshold = %d,\n", pomeloParams.threshold);
-					pomelo_sprintf(iFace, "\tsys_outputs = %d,\n", pomeloParams.sys_outputs);
-					pomelo_sprintf(iFace, "\tsys_power = %d,\n", pomeloParams.sys_power);
-					pomelo_sprintf(iFace, "\tsys_coincidence = %d,\n", pomeloParams.sys_coincidence);
+					pomelo_sprintf(iFace, "\t[t] threshold = %d,\n", pomeloParams.threshold);
+					pomelo_sprintf(iFace, "\t[o]sys_outputs = %d,\n", pomeloParams.sys_outputs);
+					pomelo_sprintf(iFace, "\t[x/z]sys_power = %d,\n", pomeloParams.sys_power);
+					pomelo_sprintf(iFace, "\t[p]sys_coincidence = %d,\n", pomeloParams.sys_coincidence);
+					pomelo_sprintf(iFace, "\t[l]sys_pulseChar = %d,\n", pomeloParams.sys_pulseChar);
 					pomelo_sprintf(iFace, "\tinitialized = %d,\n", pomeloParams.initialized);
 					pomelo_printf(iFace, "\n};\n");
 					break;
@@ -1487,7 +1630,15 @@ static void command_data_handler(uint8_t iFace, uint8_t rxChar)
 					// Set outputs via parameter
 					paramFunc = &param_list_out;
 					paramMin = 0;
-					paramMax = 63;
+					paramMax = 127;
+					cmdState = STATE_CMD_PARAM;
+					count = 0;					
+					break;
+				case 'l':
+					// Set gamma pulse char
+					paramFunc = &param_ptr_u8_pulseChar;
+					paramMin = 128;
+					paramMax = 255;
 					cmdState = STATE_CMD_PARAM;
 					count = 0;					
 					break;
@@ -1536,20 +1687,20 @@ static void command_data_handler(uint8_t iFace, uint8_t rxChar)
 					count = 0;					
 					break;
 				case '5':
-					// Set vdac_a via parameter
+					// Set vdac[0] via parameter
 					paramFunc = &param_ptr_float_hv;
 					paramMin = -50000;
 					paramMax = 50000;
-					paramPtr = &pomeloParams.vdac_a;
+					paramPtr = &pomeloParams.vdac[0];
 					cmdState = STATE_CMD_PARAM;
 					count = 0;					
 					break;
 				case '6':
-					// Set vdac_b via parameter
+					// Set vdac[1] via parameter
 					paramFunc = &param_ptr_float_hv;
 					paramMin = -50000;
 					paramMax = 50000;
-					paramPtr = &pomeloParams.vdac_b;
+					paramPtr = &pomeloParams.vdac[1];
 					cmdState = STATE_CMD_PARAM;
 					count = 0;					
 					break;
@@ -1598,13 +1749,18 @@ static void command_data_handler(uint8_t iFace, uint8_t rxChar)
 			}
 			break;
 		case STATE_CMD_PARAM:
-			if (rxChar == '\n')
+			if ((rxChar == '\n') || (rxChar == '\r'))
 			{
 				// Done, parse it
 				paramBuf[count] = 0;
 
-				temp = atof(paramBuf);
-				if ((temp < paramMin) || (temp > paramMax))
+				//temp = atof(paramBuf);
+				temp = strtof(paramBuf, &paramEnd);
+				if (*paramEnd != 0)
+				{
+					command_response(iFace, -2);
+				}
+				else if ((temp < paramMin) || (temp > paramMax))
 				{
 					command_response(iFace, -1);
 				}
@@ -1637,8 +1793,9 @@ static void command_data_handler(uint8_t iFace, uint8_t rxChar)
 static void uart_data_handler(void)
 {
 	static uint8_t c;
-	if (uart_rx(&c, 1) != 0)
+	while (uart_available())
 	{
+		c = uart_rx();
 		command_data_handler(1, c);
 	}
 }
@@ -1688,6 +1845,7 @@ static void apply_parameters(void)
 	// copy parameters in struct to variables used in ISR
 	gammaCoincidence = pomeloParams.sys_coincidence;
 	listOut = pomeloParams.sys_outputs;
+	gammaPulseChar = pomeloParams.sys_pulseChar;
 	
 	// and apply to hardware
 	dac_chan_write(&dac_instance_app, DAC_CHANNEL_1, pomeloParams.threshold);
@@ -1829,7 +1987,7 @@ int main(void)
 	udc_start();
 
 	uart_init();
-	spi_init_tmp();
+	temp_init();
 	adc_init_gamma();
 	ccl_init_coincidences();
 	timer_init_gamma();
@@ -1863,10 +2021,10 @@ int main(void)
 				{
 					gammaFifoTail = 0;
 				}
-				if ((listOut & (1<<LIST_UART_PULSE)) != 0) uart_tx("\xFF", 1);
+				if ((listOut & (1<<LIST_UART_PULSE)) != 0) uart_tx(&gammaPulseChar, 1);
 				if ((listOut & (1<<LIST_UART_ENERGY)) != 0) pomelo_sprintf(1, "%d\n", gammaFifo[gammaFifoTail]);
 				if ((listOut & (1<<LIST_UART_ENERGY_TS)) != 0) pomelo_sprintf(1, "%lu,%d\n", gammaFifoTs[gammaFifoTail], gammaFifo[gammaFifoTail]);
-				if ((listOut & (1<<LIST_USB_PULSE)) != 0) pomelo_printf(0, "\xFF");
+				if ((listOut & (1<<LIST_USB_PULSE)) != 0) pomelo_sprintf(0, "%c", gammaPulseChar);
 				if ((listOut & (1<<LIST_USB_ENERGY)) != 0) pomelo_sprintf(0, "%d\n", gammaFifo[gammaFifoTail]);
 				if ((listOut & (1<<LIST_USB_ENERGY_TS)) != 0) pomelo_sprintf(0, "%lu,%d\n", gammaFifoTs[gammaFifoTail], gammaFifo[gammaFifoTail]);
 
