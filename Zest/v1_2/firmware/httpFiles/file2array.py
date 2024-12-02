@@ -103,7 +103,7 @@ if __name__ == "__main__":
             data_type = "const unsigned char"
         source += f'{data_type} {array_name}[{define_name}] = PROGMEM {{\n'
         source += bytes2string(file_content)
-        source += "\n};"
+        source += ", 0x00\n};"
 
         fileArray = '/' + filename
         fileConst = array_name

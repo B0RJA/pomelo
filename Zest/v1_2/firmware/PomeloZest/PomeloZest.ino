@@ -1,3 +1,7 @@
+
+#define ENABLE_GPS
+
+
 #include "esp_sleep.h"
 
 #include "driver/rtc_io.h"
@@ -31,6 +35,11 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 
+
+#ifdef ENABLE_GPS
+#include <Adafruit_GPS.h>
+Adafruit_GPS GPS(&Serial0);
+#endif
 
 OneEuroFilter *cpm_euroFilter;
 OneEuroFilter *usv_euroFilter;
@@ -116,6 +125,11 @@ volatile uint16_t beep_ms;
 #define SERVICE_SPECTROSCOPY    3
 #define SERVICE_DATASTREAM      4
 #define SERVICE_TICK            5
+
+#ifdef ENABLE_GPS
+#define SERVICE_GPS             6
+#endif
+
 
 volatile uint8_t serviceList[8];
 uint8_t serviceUpdateFlags;
@@ -483,6 +497,9 @@ zestApp_t mainMenuList[] =
   {&app_menu, "Endpoint", "\x80",   &app_endpoint_updateUI, &app_endpoint_updateService,  NULL},
   {&app_menu, "BLE",      "\x5E",   &app_ble_updateUI,      &app_ble_updateService,       &app_ble_maySleepFor},
   {&app_menu, "SD Log",   "\x80",   &app_log_updateUI,      &app_log_updateService,       NULL},
+#ifdef ENABLE_GPS
+  {&app_menu, "GPS Log",  "\xAF",   &app_gps_updateUI,      &app_gps_updateService,       app_gps_maySleepFor},
+#endif
   {&app_menu, "Settings", "\x81",   &app_settings_updateUI, &app_settings_updateService,  NULL},
   {&app_menu, "Info",     "\xBC",   &app_info_updateUI,     &app_info_updateService,      NULL},
 };
@@ -674,6 +691,12 @@ void setup()
 
   // Can this be made to work without rebooting ESP32 on connect / disconnect?
   //Serial.begin(115200);   // USB CDC
+
+#ifdef ENABLE_GPS
+  GPS.begin(9600);
+  GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
+  GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ); // 1 Hz update rate
+#endif
 
   preferences.begin("pomeloZest", false);
   wifi_ssid = preferences.getString("ssid", ""); 
@@ -869,6 +892,22 @@ void loop()
   {
     backlight(1); // Fade out
   }
+
+
+#ifdef ENABLE_GPS
+  while (GPS.read() != 0) ;
+  if (GPS.newNMEAreceived())
+  {
+    GPS.parse(GPS.lastNMEA());
+    if (strncmp(GPS.lastNMEA(), "$GNGGA", 6) == 0)
+    {
+      if ((int)GPS.fix != 0)  // Only let app know if we have a fix
+      {
+        if (serviceList[SERVICE_GPS] != 0) serviceUpdateFlags |= (1 << SERVICE_GPS);
+      }
+    }
+  }
+#endif
 
   if (serialAvailable())
   {

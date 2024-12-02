@@ -1,5 +1,5 @@
 
 cat fileList.txt | while read line
 do
-	python file2array.py -f $line -a -o uPlot.h -t "const char"
+	python3 file2array.py -f $line -a -o app_http_files.h -t "const char"
 done

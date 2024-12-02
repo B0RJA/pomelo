@@ -342,7 +342,7 @@ void app_http_startServer()
         if (p->name() == "pass") wifi_pass = p->value();
       }
     }
-    if (update && wifi_ssid != "")
+    if (update)
     {
       preferences.begin("pomeloZest", false);
       preferences.putString("ssid", wifi_ssid); 
