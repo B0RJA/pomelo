@@ -125,7 +125,7 @@
 
 /* Configure GCLK generator 0 (Main Clock) */
 #  define CONF_CLOCK_GCLK_0_ENABLE                true
-#  define CONF_CLOCK_GCLK_0_RUN_IN_STANDBY        false
+#  define CONF_CLOCK_GCLK_0_RUN_IN_STANDBY        true
 #  define CONF_CLOCK_GCLK_0_CLOCK_SOURCE          SYSTEM_CLOCK_SOURCE_OSC16M
 #  define CONF_CLOCK_GCLK_0_PRESCALER             1
 #  define CONF_CLOCK_GCLK_0_OUTPUT_ENABLE         false
@@ -140,8 +140,8 @@
 /* Configure GCLK generator 2 -- Source for DAC */
 #  define CONF_CLOCK_GCLK_2_ENABLE                true
 #  define CONF_CLOCK_GCLK_2_RUN_IN_STANDBY        true
-#  define CONF_CLOCK_GCLK_2_CLOCK_SOURCE          SYSTEM_CLOCK_SOURCE_XOSC32K
-#  define CONF_CLOCK_GCLK_2_PRESCALER             3
+#  define CONF_CLOCK_GCLK_2_CLOCK_SOURCE          SYSTEM_CLOCK_SOURCE_OSC16M
+#  define CONF_CLOCK_GCLK_2_PRESCALER             128
 #  define CONF_CLOCK_GCLK_2_OUTPUT_ENABLE         false
 
 /* Configure GCLK generator 3 -- USB */
@@ -151,14 +151,14 @@
 #  define CONF_CLOCK_GCLK_3_PRESCALER             1
 #  define CONF_CLOCK_GCLK_3_OUTPUT_ENABLE         false
 
-/* Configure GCLK generator 4 -- feeds the home-made boost converter */
+/* Configure GCLK generator 4 -- feeds a timer and home-made boost converter in low power mode */
 #  define CONF_CLOCK_GCLK_4_ENABLE                true
 #  define CONF_CLOCK_GCLK_4_RUN_IN_STANDBY        true
 #  define CONF_CLOCK_GCLK_4_CLOCK_SOURCE          SYSTEM_CLOCK_SOURCE_XOSC32K
 #  define CONF_CLOCK_GCLK_4_PRESCALER             1
 #  define CONF_CLOCK_GCLK_4_OUTPUT_ENABLE         true
 
-/* Configure GCLK generator 5 */
+/* Configure GCLK generator 5 -- feeds home-made boost converter in high power mode */
 #  define CONF_CLOCK_GCLK_5_ENABLE                false
 #  define CONF_CLOCK_GCLK_5_RUN_IN_STANDBY        false
 #  define CONF_CLOCK_GCLK_5_CLOCK_SOURCE          SYSTEM_CLOCK_SOURCE_OSC16M

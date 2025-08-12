@@ -33,6 +33,8 @@ typedef enum _UsbState_t
 static struct core_params coreParams;
 static struct physics_params physicsParams;
 
+static float hvSipmVolts;
+
 #define FILTER_LEN			4
 extern const uint16_t pMove[1024][9];
 
@@ -42,6 +44,12 @@ static struct rtc_module rtc_instance_app;
 struct spi_module spi_instance_app;
 static struct i2c_master_module i2c_instance_app;
 static struct tc_module tc_instance_app;
+static struct tcc_module tcc_instance_app_pwm;
+
+volatile static uint32_t hvloadTime;
+volatile static uint32_t hvloadOn;
+volatile static uint32_t hvloadOff;
+static bool hvBoost;
 
 volatile static uint32_t gammaTime;
 volatile static uint32_t gammaCounts;
@@ -68,11 +76,9 @@ volatile bool isr_vbus;
 
 static CmdState_t cmdState;
 
-
 static struct usart_module app_uart_module;
 static volatile uint8_t rxBufHead, rxBufTail;
 static volatile uint8_t rxBuf[UART_BUFFER_LEN];
-
 
 static void reset_to_bootloader(void);
 void pomelo_printf(uint8_t iFace, const char* str);
@@ -153,19 +159,26 @@ static void isr_vbus_callback(void)
 	isr_vbus = true;
 }
 
+static inline void timer_updateValues_unsafe()
+{
+	uint32_t timerCounts;
+	timerCounts = tc_get_count_value(&tc_instance_app);
+	gammaTime += timerCounts;
+	hvloadTime += timerCounts;
+	tc_set_count_value(&tc_instance_app, 0);
+}
+
 
 static void synchronizer_callback(void)
 {
-	static uint32_t l_gammaTime;
-
 	if (listOut != 0)
 	{
 		if (gammaFifoHead != gammaFifoTail)
 		{
-			l_gammaTime = gammaTime + tc_get_count_value(&tc_instance_app);
+			timer_updateValues_unsafe();
 
 			gammaFifo[gammaFifoHead] = 9999;
-			gammaFifoTs[gammaFifoHead] = l_gammaTime;
+			gammaFifoTs[gammaFifoHead] = gammaTime;
 			gammaFifoHead++;
 			if (gammaFifoHead >= LIST_FIFO_LEN)
 			{
@@ -180,7 +193,6 @@ static void trigger_callback(void)
 {
 	static uint16_t adc_val, rnd, i;
 	static volatile bool pinValue;
-	static uint32_t l_gammaTime;
 	pinValue = port_pin_get_input_level(PIN_PA18);
 
 	if (daq_enabled)
@@ -231,10 +243,10 @@ static void trigger_callback(void)
 					{
 						if (gammaFifoHead != gammaFifoTail)
 						{
-							l_gammaTime = gammaTime + tc_get_count_value(&tc_instance_app);
+							timer_updateValues_unsafe();
 
 							gammaFifo[gammaFifoHead] = adc_val;
-							gammaFifoTs[gammaFifoHead] = l_gammaTime;
+							gammaFifoTs[gammaFifoHead] = gammaTime;
 							gammaFifoHead++;
 							if (gammaFifoHead >= LIST_FIFO_LEN)
 							{
@@ -243,10 +255,12 @@ static void trigger_callback(void)
 						}
 					}
 					
-					// Assert our ACK line
-					port_pin_set_output_level(PIN_PB11, 1);
 					// Loop while monitor line is still high
-					while (port_pin_get_input_level(PIN_PA20)) ;
+					while (port_pin_get_input_level(PIN_PA20))
+					{
+						// Assert our ACK line if downstream detectors are also in ACK
+						port_pin_set_output_level(PIN_PB11, port_pin_get_input_level(PIN_PA09));
+					}
 					// Deassert our ACK line
 					port_pin_set_output_level(PIN_PB11, 0);
 				}
@@ -264,10 +278,10 @@ static void trigger_callback(void)
 					}
 					else if (gammaFifoHead != gammaFifoTail)
 					{
-						l_gammaTime = gammaTime + tc_get_count_value(&tc_instance_app);
+						timer_updateValues_unsafe();
 
 						gammaFifo[gammaFifoHead] = adc_val;
-						gammaFifoTs[gammaFifoHead] = l_gammaTime;
+						gammaFifoTs[gammaFifoHead] = gammaTime;
 						gammaFifoHead++;
 						if (gammaFifoHead >= LIST_FIFO_LEN)
 						{
@@ -315,8 +329,55 @@ static void rtc_callback_periodic(void)
 static void timer_callback(struct tc_module *const module)
 {
 	gammaTime += 65536;
+	hvloadTime += 65536;
 }
 
+
+static void hvload_callback(void)
+{
+	static uint32_t tOn = 0;
+	static uint32_t tOff = 0;
+	static volatile bool pinValue;
+	pinValue = port_pin_get_input_level(PIN_PB10);
+	timer_updateValues_unsafe();
+	if (pinValue)
+	{
+		tOff = hvloadTime;
+		hvloadTime = 0;
+		if (tOn != 0)
+		{
+			hvloadOn = tOn;
+			hvloadOff = tOff;
+			tOn = 0;
+			tOff = 0;
+		}
+	}
+	else
+	{
+		tOn = hvloadTime;
+		hvloadTime = 0;
+	}
+}
+
+
+static float hvload_uA()
+{
+	float iOut;
+	
+	if ((hvloadTime < 65535) && (hvloadOff != 0))
+	{
+		iOut = coreParams.iMeas[1] / hvloadOff + coreParams.iMeas[0];
+		// 5.6 MOhm resistor in LT3014 feedback loop steals some current too. But resistor value is loaded from parameter
+		if (coreParams.iMeas[2] != 0) iOut -= (hvSipmVolts - 1.22)/coreParams.iMeas[2];
+		if (iOut < 0) iOut = 0;
+	}
+	else
+	{
+		iOut = 9999;
+	}
+	
+	return iOut;
+}
 
 static void timer_init_gamma(void)
 {
@@ -329,7 +390,7 @@ static void timer_init_gamma(void)
 	tc_conf.count_direction = TC_COUNT_DIRECTION_UP;
 	tc_conf.oneshot = false;
 	tc_conf.run_in_standby = true;
-	tc_init(&tc_instance_app, TC1, &tc_conf);
+	tc_init(&tc_instance_app, TC0, &tc_conf);
 	
 	tc_register_callback(&tc_instance_app, timer_callback, TC_CALLBACK_OVERFLOW);
 	tc_enable_callback(&tc_instance_app, TC_CALLBACK_OVERFLOW);
@@ -337,12 +398,50 @@ static void timer_init_gamma(void)
 	tc_enable(&tc_instance_app);
 }
 
-static void ccl_init_coincidences(void)
+static void coincidences_reset(void)
+{
+	struct port_config pin_conf;
+
+	ccl_module_reset();
+	
+	// All pins set as inputs with pull-down enabled
+	port_get_config_defaults(&pin_conf);
+	pin_conf.direction  = PORT_PIN_DIR_INPUT;
+	pin_conf.input_pull = SYSTEM_PINMUX_PIN_PULL_DOWN;
+
+	// CCL2 and CCL0 inputs and outputs
+	port_pin_set_config(PIN_PA23, &pin_conf);
+	port_pin_set_config(PIN_PA22, &pin_conf);
+	port_pin_set_config(PIN_PB22, &pin_conf);
+	port_pin_set_config(PIN_PB09, &pin_conf);
+	port_pin_set_config(PIN_PB23, &pin_conf);
+	
+	// Software clear mechanism inputs and output
+	port_pin_set_config(PIN_PA20, &pin_conf);
+	port_pin_set_config(PIN_PA09, &pin_conf);
+	port_pin_set_config(PIN_PB11, &pin_conf);
+	
+	// Also handle synchronization config
+	port_pin_set_config(PIN_PB02, &pin_conf);
+}
+
+static void coincidences_enable(void)
 {
 	struct ccl_config ccl_conf;
 	struct ccl_lut_config ccl_lut_conf;
 	struct system_pinmux_config pinmux_config;
+	struct port_config pin_conf;
 
+	// Coincidences synchronizer output
+	pin_conf.direction  = PORT_PIN_DIR_OUTPUT;
+	port_pin_set_config(PIN_PB02, &pin_conf);
+	port_pin_set_output_level(PIN_PB02, 0);
+	
+	// ACK output
+	pin_conf.direction  = PORT_PIN_DIR_OUTPUT;
+	port_pin_set_config(PIN_PB11, &pin_conf);
+	port_pin_set_output_level(PIN_PB11, 0);
+	
 	// Set PA22 as remote trigger input - CCL2 In0
 	system_pinmux_get_config_defaults(&pinmux_config);
 	pinmux_config.mux_position = 8;
@@ -357,19 +456,18 @@ static void ccl_init_coincidences(void)
 	pinmux_config.input_pull   = SYSTEM_PINMUX_PIN_PULL_DOWN;
 	system_pinmux_pin_set_config(PIN_PA23, &pinmux_config);
 
+	// Set PB09 as coincidences output - CCL2 out
+	system_pinmux_get_config_defaults(&pinmux_config);
+	pinmux_config.mux_position = 8;
+	pinmux_config.direction    = SYSTEM_PINMUX_PIN_DIR_OUTPUT_WITH_READBACK;
+	system_pinmux_pin_set_config(PIN_PB09, &pinmux_config);
+
 	// Set PB22 as ACK0 input - CCL0 In0
 	system_pinmux_get_config_defaults(&pinmux_config);
 	pinmux_config.mux_position = 8;
 	pinmux_config.direction    = SYSTEM_PINMUX_PIN_DIR_INPUT;
 	pinmux_config.input_pull   = SYSTEM_PINMUX_PIN_PULL_DOWN;
 	system_pinmux_pin_set_config(PIN_PB22, &pinmux_config);
-
-	// Set PA06 as ACK1 input - CCL0 In2
-	system_pinmux_get_config_defaults(&pinmux_config);
-	pinmux_config.mux_position = 8;
-	pinmux_config.direction    = SYSTEM_PINMUX_PIN_DIR_INPUT;
-	pinmux_config.input_pull   = SYSTEM_PINMUX_PIN_PULL_DOWN;
-	system_pinmux_pin_set_config(PIN_PA06, &pinmux_config);
 
 	// Set PB23 as coincidences output - CCL0 out
 	system_pinmux_get_config_defaults(&pinmux_config);
@@ -397,7 +495,7 @@ static void ccl_init_coincidences(void)
 	ccl_lut_conf.truth_table_value = 0xF8;		// (In0 AND In1) OR In2
 	ccl_lut_set_config(CCL_LUT_2, &ccl_lut_conf);
 
-	// LUT0: In0 ACK0, In1: Lnk, In2 ACK1; (ACK0 and ACK1) reset, output to pin
+	// LUT0: In0 ACK, In1: Lnk; ACK0 reset, output to pin
 	ccl_lut_get_config_defaults(&ccl_lut_conf);
 	ccl_lut_conf.edge_selection_enable = false;
 	ccl_lut_conf.event_input_enable = false;
@@ -405,8 +503,8 @@ static void ccl_init_coincidences(void)
 	ccl_lut_conf.filter_sel = CCL_LUT_FILTER_DISABLE;
 	ccl_lut_conf.input0_src_sel = CCL_LUT_INPUT_SRC_IO;
 	ccl_lut_conf.input1_src_sel = CCL_LUT_INPUT_SRC_LINK;
-	ccl_lut_conf.input2_src_sel = CCL_LUT_INPUT_SRC_IO;
-	ccl_lut_conf.truth_table_value = 0x4C;	// In1 AND NOT (In0 AND In2)
+	ccl_lut_conf.input2_src_sel = CCL_LUT_INPUT_SRC_MASK;
+	ccl_lut_conf.truth_table_value = 0x44;	// In1 AND NOT In0
 	ccl_lut_set_config(CCL_LUT_0, &ccl_lut_conf);
 
 	// LUT1: Pass
@@ -442,19 +540,126 @@ static void ccl_init_coincidences(void)
 }
 
 
-
 void hv_enable(void)
 {
 	struct system_pinmux_config pinmux_config;
-	system_pinmux_get_config_defaults(&pinmux_config);
-	pinmux_config.mux_position = 7;
-	pinmux_config.direction    = PORT_PIN_DIR_OUTPUT;
-	system_pinmux_pin_set_config(PIN_PA10, &pinmux_config);
+	struct system_gclk_gen_config gclk_conf;
+	struct tcc_config tcc_conf;
+
+	if (hvBoost)
+	{
+		// Can do max ~300uA
+		// To do: tune period and inductor duty cycle
+
+		// Configure clock generator for TCC
+		system_gclk_gen_get_config_defaults(&gclk_conf);
+		gclk_conf.source_clock = SYSTEM_CLOCK_SOURCE_OSC16M;
+		gclk_conf.division_factor = 1;
+		gclk_conf.output_enable = false;
+		gclk_conf.run_in_standby = true;
+		system_gclk_gen_set_config(GCLK_GENERATOR_5, &gclk_conf);
+		system_gclk_gen_enable(GCLK_GENERATOR_5);
+		
+		// Configure and start PWM on PA10 with TCC
+		tcc_get_config_defaults(&tcc_conf, TCC0);
+		tcc_conf.counter.clock_source = GCLK_GENERATOR_5;
+		tcc_conf.counter.clock_prescaler = TCC_CLOCK_PRESCALER_DIV1;
+		tcc_conf.counter.period = 700;
+		tcc_conf.compare.channel_function[2] = TCC_CHANNEL_FUNCTION_COMPARE;
+		tcc_conf.compare.match[2] = 64;
+		tcc_conf.compare.wave_polarity[2] = TCC_WAVE_POLARITY_1;
+		tcc_conf.compare.wave_generation = TCC_WAVE_GENERATION_SINGLE_SLOPE_PWM;
+		tcc_conf.compare.wave_ramp = TCC_RAMP_RAMP1;
+		tcc_conf.pins.wave_out_pin[2] = PIN_PA10F_TCC0_WO2;
+		tcc_conf.pins.wave_out_pin_mux[2] = MUX_PA10F_TCC0_WO2;
+		tcc_conf.pins.enable_wave_out_pin[2] = true;
+		tcc_conf.run_in_standby = true;
+	
+		tcc_init(&tcc_instance_app_pwm, TCC0, &tcc_conf);
+		tcc_enable(&tcc_instance_app_pwm);
+	}
+	else
+	{
+		// Connect clock generator output to pin PA10
+		system_pinmux_get_config_defaults(&pinmux_config);
+		pinmux_config.mux_position = 7;
+		pinmux_config.direction    = PORT_PIN_DIR_OUTPUT;
+		system_pinmux_pin_set_config(PIN_PA10, &pinmux_config);
+	}
+}
+
+
+void hv_changeBoost(bool newHvBoost)
+{
+	// ONLY WHEN HV IS ALREADY RUNNING!
+	
+	struct system_pinmux_config pinmux_config;
+	struct system_gclk_gen_config gclk_conf;
+	struct tcc_config tcc_conf;
+
+	if (newHvBoost == hvBoost) return;
+
+	if (newHvBoost)
+	{
+		// Enable boost
+
+		// Configure clock generator for TCC
+		system_gclk_gen_get_config_defaults(&gclk_conf);
+		gclk_conf.source_clock = SYSTEM_CLOCK_SOURCE_OSC16M;
+		gclk_conf.division_factor = 1;
+		gclk_conf.output_enable = false;
+		gclk_conf.run_in_standby = true;
+		system_gclk_gen_set_config(GCLK_GENERATOR_5, &gclk_conf);
+		system_gclk_gen_enable(GCLK_GENERATOR_5);
+		
+		// Configure and start PWM on PA10 with TCC
+		tcc_get_config_defaults(&tcc_conf, TCC0);
+		tcc_conf.counter.clock_source = GCLK_GENERATOR_5;
+		tcc_conf.counter.clock_prescaler = TCC_CLOCK_PRESCALER_DIV1;
+		tcc_conf.counter.period = 700;
+		tcc_conf.compare.channel_function[2] = TCC_CHANNEL_FUNCTION_COMPARE;
+		tcc_conf.compare.match[2] = 64;
+		tcc_conf.compare.wave_polarity[2] = TCC_WAVE_POLARITY_1;
+		tcc_conf.compare.wave_generation = TCC_WAVE_GENERATION_SINGLE_SLOPE_PWM;
+		tcc_conf.compare.wave_ramp = TCC_RAMP_RAMP1;
+
+		tcc_conf.pins.wave_out_pin[2] = PIN_PA10F_TCC0_WO2;
+		tcc_conf.pins.wave_out_pin_mux[2] = MUX_PA10F_TCC0_WO2;
+		tcc_conf.pins.enable_wave_out_pin[2] = true;
+		tcc_conf.run_in_standby = true;
+		
+		tcc_init(&tcc_instance_app_pwm, TCC0, &tcc_conf);
+		tcc_enable(&tcc_instance_app_pwm);
+	}
+	else
+	{
+		// Connect clock generator output to pin PA10
+		system_pinmux_get_config_defaults(&pinmux_config);
+		pinmux_config.mux_position = 7;
+		pinmux_config.direction    = PORT_PIN_DIR_OUTPUT;
+		system_pinmux_pin_set_config(PIN_PA10, &pinmux_config);
+
+		// Now switch off unnecessary parts
+		tcc_disable(&tcc_instance_app_pwm);
+		tcc_reset(&tcc_instance_app_pwm);
+		system_gclk_gen_disable(GCLK_GENERATOR_5);
+	}
+	
+	hvBoost = newHvBoost;
 }
 
 void hv_disable(void)
 {
 	struct port_config pin_conf;
+	struct system_gclk_gen_config gclk_conf;
+
+	if (hvBoost)
+	{
+		tcc_disable(&tcc_instance_app_pwm);
+		tcc_reset(&tcc_instance_app_pwm);
+		system_gclk_gen_disable(GCLK_GENERATOR_5);
+	}
+	
 	port_get_config_defaults(&pin_conf);
 
 	// HV PWM output 0
@@ -468,27 +673,6 @@ void hv_disable(void)
 	port_pin_set_output_level(PIN_PA21, 1);
 }
 
-void hv_boost(bool boostOn)
-{
-	struct system_gclk_gen_config gclk_conf;
-
-	system_gclk_gen_disable(GCLK_GENERATOR_4);
-	system_gclk_gen_get_config_defaults(&gclk_conf);
-	if (boostOn)
-	{
-		gclk_conf.source_clock = SYSTEM_CLOCK_SOURCE_OSC16M;
-		gclk_conf.division_factor = 128;
-	}
-	else
-	{
-		gclk_conf.source_clock = SYSTEM_CLOCK_SOURCE_XOSC32K;
-		gclk_conf.division_factor = 1;
-	}
-	gclk_conf.run_in_standby = true;
-	gclk_conf.output_enable = true;
-	system_gclk_gen_set_config(GCLK_GENERATOR_4, &gclk_conf);
-	system_gclk_gen_enable(GCLK_GENERATOR_4);
-}
 
 static void adc_init_gamma(void)
 {
@@ -579,7 +763,7 @@ static void read_physics(uint8_t n, uint8_t *data)
 
 	addr = 0;
 
-	timeOut = 100;
+	timeOut = 5;
 	while (timeOut > 0)
 	{
 		status = i2c_master_write_packet_wait_no_stop(&i2c_instance_app, &master_packet);
@@ -613,7 +797,7 @@ static void write_physics(uint8_t page, uint8_t n, uint8_t *data)
 
 	addr = page << 4;
 
-	timeOut = 100;
+	timeOut = 5;
 	while (timeOut > 0)
 	{
 		status = i2c_master_write_packet_wait_no_stop(&i2c_instance_app, &master_packet);
@@ -627,7 +811,7 @@ static void write_physics(uint8_t page, uint8_t n, uint8_t *data)
 	i2c_master_send_stop(&i2c_instance_app);
 }
 
-/*
+
 static void init_physics()
 {
 	uint16_t writeBytes, i;
@@ -638,9 +822,11 @@ static void init_physics()
 		.sipm_vTempComp = 0.03593,
 		.ecal = {0, 1, 0},
 		.uSvph_constant = 2.09534976,
+		//.detString = "CapeScint LaBr-14x25c-SiPM-T",
+		//.detString = "3\" Adapter, Broadcom 8x8mm2 SiPM",
 		.detString = "CsI(Tl) 2cm3, Broadcom 4x4mm2 SiPM",
 		.tempType = 1,
-		.initialized = 0x55,
+		.version = 0x01,
 	};
 	
 	writeBytes = sizeof(params);
@@ -658,7 +844,37 @@ static void init_physics()
 	}
 
 }
-*/
+
+
+static float read_temp_pct2075(void)
+{
+	enum status_code status;
+	uint8_t i2c_buffer[2];
+	int16_t output;
+	struct i2c_master_packet master_packet = {
+		.address     = 0x49,
+		.data_length = 2,
+		.data        = i2c_buffer,
+		.ten_bit_address = false,
+		.high_speed      = false,
+		.hs_master_code  = 0x0,
+	};
+
+	i2c_buffer[0] = 0; // read from temperaure register @ addr 0
+	master_packet.data_length = 1;
+
+	status = i2c_master_write_packet_wait_no_stop(&i2c_instance_app, &master_packet);
+
+	master_packet.data_length = 2;
+
+	status = i2c_master_read_packet_wait(&i2c_instance_app, &master_packet);
+	output = (int16_t)(((uint16_t)i2c_buffer[0] << 8) | i2c_buffer[1]);
+
+	output = output >> 5;
+
+	return output*0.125;
+}
+
 
 static void temp_init_tmp116(void)
 {
@@ -764,6 +980,8 @@ static void temp_init(void)
 {
 	switch (physicsParams.tempType)
 	{
+		case 0:
+			break;
 		case 1:
 			temp_init_tmp116();
 			break;
@@ -777,6 +995,9 @@ static float read_temp(void)
 {
 	switch (physicsParams.tempType)
 	{
+		case 0:
+			return read_temp_pct2075();
+			break;
 		case 1:
 			return read_temp_tmp116();
 			break;
@@ -790,20 +1011,25 @@ static float read_temp(void)
 	return 0;
 }
 
-static void update_hv_temp()
+static void update_hv_temp(bool force)
 {
-	float temp, volts, dacHvValue;
+	static uint16_t oldDacHvValue = 0;
+	float temp, dacHvValue;
 	temp = read_temp();
 	// Maybe need to update with values from datasheet numbers: 0.03633 * dDAC/dV. Comes out to -10.0961 for one board
 	//delta = (int16_t)(-5.8784*(temp - tempCompTemp));		// Calculated from Am-241 data
-	volts = physicsParams.sipm_v0deg + physicsParams.sipm_vTempComp*temp;
-	if (volts > physicsParams.sipm_vMax) volts = physicsParams.sipm_vMax;
-	if (volts < physicsParams.sipm_vMin) volts = physicsParams.sipm_vMin;
-	
-	dacHvValue = coreParams.vdac[0] + coreParams.vdac[1]*volts;
+	hvSipmVolts = physicsParams.sipm_v0deg + physicsParams.sipm_vTempComp*temp;
+	if (hvSipmVolts > physicsParams.sipm_vMax) hvSipmVolts = physicsParams.sipm_vMax;
+	if (hvSipmVolts < physicsParams.sipm_vMin) hvSipmVolts = physicsParams.sipm_vMin;
+
+	dacHvValue = coreParams.vDac[0] + coreParams.vDac[1]*hvSipmVolts;
 	if (dacHvValue > 4095) dacHvValue = 4095;
 	if (dacHvValue < 0) dacHvValue = 0;
-	dac_chan_write(&dac_instance_app, DAC_CHANNEL_0, (uint16_t)dacHvValue);
+	if (force || ((uint16_t)dacHvValue != oldDacHvValue))
+	{
+		oldDacHvValue = (uint16_t)dacHvValue;
+		dac_chan_write(&dac_instance_app, DAC_CHANNEL_0, oldDacHvValue);
+	}
 }
 
 static void eic_init()
@@ -850,6 +1076,20 @@ static void eic_init()
 
 	extint_register_callback(synchronizer_callback, 8, EXTINT_CALLBACK_TYPE_DETECT);
 	extint_chan_enable_callback(8, EXTINT_CALLBACK_TYPE_DETECT);
+
+
+	// HV load measurement using PB10
+	extint_chan_get_config_defaults(&eint_chan_conf);
+	eint_chan_conf.gpio_pin           = PIN_PB10A_EIC_EXTINT10;
+	eint_chan_conf.gpio_pin_mux       = MUX_PB10A_EIC_EXTINT10;
+	eint_chan_conf.detection_criteria = EXTINT_DETECT_BOTH;
+	eint_chan_conf.gpio_pin_pull      = SYSTEM_PINMUX_PIN_PULL_NONE;
+	eint_chan_conf.filter_input_signal = false;
+	eint_chan_conf.enable_async_edge_detection = true;
+	extint_chan_set_config(10, &eint_chan_conf);
+
+	extint_register_callback(hvload_callback, 10, EXTINT_CALLBACK_TYPE_DETECT);
+	extint_chan_enable_callback(10, EXTINT_CALLBACK_TYPE_DETECT);
 
 }
 
@@ -1111,6 +1351,7 @@ static void main_clock_select_osc16m(void)
 	system_gclk_gen_get_config_defaults(&gclk_conf);
 	gclk_conf.source_clock = SYSTEM_CLOCK_SOURCE_OSC16M;
 	gclk_conf.division_factor = 1;
+	gclk_conf.run_in_standby = true;
 	system_gclk_gen_set_config(GCLK_GENERATOR_0, &gclk_conf);
 	if (CONF_CLOCK_OSC16M_ON_DEMAND) {
 		OSCCTRL->OSC16MCTRL.reg |= OSCCTRL_OSC16MCTRL_ONDEMAND;
@@ -1246,7 +1487,7 @@ static void pomelo_on()
 		dac_init_gamma_hv();
 		dac_chan_write(&dac_instance_app, DAC_CHANNEL_0, 4095);	// Immediately set a value that drives HV as low as possible
 		dac_chan_write(&dac_instance_app, DAC_CHANNEL_1, coreParams.threshold);
-		update_hv_temp();
+		update_hv_temp(true);
 		port_pin_set_output_level(PIN_PA14, 1);
 		hv_enable();
 		daq_enabled = true;
@@ -1275,11 +1516,13 @@ static void load_parameters(void)
 		nvm_read_buffer(NVM_RWW + i*NVMCTRL_PAGE_SIZE, (uint8_t*)(&coreParams) + i*NVMCTRL_PAGE_SIZE, readBytes - i*NVMCTRL_PAGE_SIZE);
 	}
 	
-	if (coreParams.initialized != 0x55)
+	if (coreParams.version == 0xFF)
 	{
 		// EEPROM uninitialized, place safe values in structure
-		coreParams.vdac[0] = 0.0;
-		coreParams.vdac[1] = 1.0;
+		coreParams.vDac[0] = 0.0;
+		coreParams.vDac[1] = 1.0;
+		coreParams.iMeas[0] = 0.0;
+		coreParams.iMeas[1] = 0.0;
 		coreParams.threshold = 4095;
 		coreParams.sys_power = false;
 		coreParams.sys_outputs = 0;			// There is a variable that this has to be synched up with
@@ -1291,7 +1534,7 @@ static void load_parameters(void)
 	readBytes = sizeof(physicsParams);
 	read_physics(readBytes, (uint8_t*)(&physicsParams));
 
-	if (physicsParams.initialized != 0x55)
+	if (physicsParams.version == 0xFF)
 	{
 		physicsParams.sipm_vMin = 1;
 		physicsParams.sipm_vMax = 4095;
@@ -1316,7 +1559,7 @@ static int8_t save_parameters(void)
 	coreParams.sys_outputs = listOut;
 	coreParams.sys_power = daq_enabled;
 	coreParams.sys_pulseChar = gammaPulseChar;
-	coreParams.initialized = 0x55;
+	coreParams.version = 0x01;
 
 	writeBytes = sizeof(coreParams);
 	
@@ -1342,7 +1585,7 @@ static int8_t save_parameters(void)
 		if (sc != STATUS_OK) return -2;
 	}
 
-	physicsParams.initialized = 0x55;
+	physicsParams.version = 0x01;
 	writeBytes = sizeof(physicsParams);
 
 	// Write structure to I2C eeprom
@@ -1360,6 +1603,71 @@ static int8_t save_parameters(void)
 	return 0;
 }
 
+static void upgradePhysics()
+{
+	struct physics_params_old physicsParamsOld;
+	uint16_t readBytes;
+
+	// Load structure from I2C eeprom
+	readBytes = sizeof(physicsParamsOld);
+	read_physics(readBytes, (uint8_t*)(&physicsParamsOld));
+
+	if (physicsParamsOld.initialized == 0x55)
+	{
+		physicsParams.version = 0x01;
+		physicsParams.sipm_vMin = physicsParamsOld.sipm_vMin;
+		physicsParams.sipm_vMax = physicsParamsOld.sipm_vMax;
+		physicsParams.sipm_v0deg = physicsParamsOld.sipm_v0deg;
+		physicsParams.sipm_vTempComp = physicsParamsOld.sipm_vTempComp;
+		physicsParams.ecal[0] = physicsParamsOld.ecal[0];
+		physicsParams.ecal[1] = physicsParamsOld.ecal[1];
+		physicsParams.ecal[2] = physicsParamsOld.ecal[2];
+		physicsParams.uSvph_constant = physicsParamsOld.uSvph_constant;
+		strcpy(physicsParams.detString, physicsParamsOld.detString);
+		physicsParams.tempType = physicsParamsOld.tempType;
+	}
+}
+
+static void upgradeCore()
+{
+	struct core_params_old coreParamsOld;
+	uint16_t readBytes;
+	uint8_t i;
+	
+	// Load structure from NVM
+	readBytes = sizeof(coreParamsOld);
+
+	for (i = 0; i < readBytes/NVMCTRL_PAGE_SIZE; i++)
+	{
+		// Read each page at corresponding position
+		nvm_read_buffer(NVM_RWW + i*NVMCTRL_PAGE_SIZE, (uint8_t*)(&coreParamsOld) + i*NVMCTRL_PAGE_SIZE, NVMCTRL_PAGE_SIZE);
+	}
+
+	if (readBytes > i*NVMCTRL_PAGE_SIZE)
+	{
+		// We need to read a bit more, but not a full page
+		nvm_read_buffer(NVM_RWW + i*NVMCTRL_PAGE_SIZE, (uint8_t*)(&coreParamsOld) + i*NVMCTRL_PAGE_SIZE, readBytes - i*NVMCTRL_PAGE_SIZE);
+	}
+	
+	if (coreParamsOld.initialized == 0x55)
+	{
+		gammaCoincidence = coreParamsOld.sys_coincidence;
+		listOut = coreParamsOld.sys_outputs;
+		daq_enabled = coreParamsOld.sys_power;
+		gammaPulseChar = coreParamsOld.sys_pulseChar;
+		coreParams.version = 0x01;
+		coreParams.iMeas[0] = 0;
+		coreParams.iMeas[1] = 0;
+		coreParams.vDac[0] = coreParamsOld.vdac[0];
+		coreParams.vDac[1] = coreParamsOld.vdac[1];
+		coreParams.threshold = coreParamsOld.threshold;
+		coreParams.sys_power = coreParamsOld.sys_power;
+		coreParams.sys_outputs = coreParamsOld.sys_outputs;
+		coreParams.sys_coincidence = coreParamsOld.sys_coincidence;
+		coreParams.sys_pulseChar = coreParamsOld.sys_pulseChar;
+	}
+
+}
 
 static int8_t clear_parameters(void)
 {
@@ -1379,119 +1687,6 @@ static int8_t clear_parameters(void)
 }
 
 
-static void param_bootloader(uint8_t iFace, float f, void *dest)
-{
-	int16_t n;
-	n = (int16_t)f;
-	if (n == -1234)
-	{
-		pomelo_off();
-		reset_to_bootloader();
-	}
-	else
-	{
-		command_response(iFace, -1);
-	}
-}
-
-static void param_adc_calib(uint8_t iFace, float f, void *dest)
-{
-	int16_t n;
-	n = (int16_t)f;
-	if (n == -9876)
-	{
-		// Kill
-		pomelo_off();
-		adc_calib(iFace);
-	}
-	else
-	{
-		command_response(iFace, -1);
-	}
-}
-
-static void param_write_nvm(uint8_t iFace, float f, void *dest)
-{
-	int16_t n;
-	n = (int16_t)f;
-	if (n == -2024)
-	{
-		command_response(iFace, save_parameters());
-	}
-	else
-	{
-		command_response(iFace, -1);
-	}
-}
-
-
-static void param_reboot(uint8_t iFace, float f, void *dest)
-{
-	int16_t n;
-	n = (int16_t)f;
-	if (n == -6666)
-	{
-		NVIC_SystemReset();
-	}
-	else
-	{
-		command_response(iFace, -1);
-	}
-}
-
-static void param_threshold(uint8_t iFace, float f, void *dest)
-{
-	int16_t n;
-	n = (int16_t)f;
-
-	coreParams.threshold = n;
-	dac_chan_write(&dac_instance_app, DAC_CHANNEL_1, coreParams.threshold);
-	command_response(iFace, 0);
-}
-
-static void param_list_out(uint8_t iFace, float f, void *dest)
-{
-	int16_t n;
-	n = (int16_t)f;
-
-	gammaFifoHead = 1;
-	gammaFifoTail = 0;
-	listOut = n;
-	coreParams.sys_outputs = listOut;
-	command_response(iFace, 0);
-}
-
-static void param_coincidence(uint8_t iFace, float f, void *dest)
-{
-	int16_t n;
-	n = (int16_t)f;
-
-	if (n == 0) gammaCoincidence = false;
-	else gammaCoincidence = true;
-	coreParams.sys_coincidence = gammaCoincidence;
-	command_response(iFace, 0);
-}
-
-static void param_ptr_float(uint8_t iFace, float f, void *dest)
-{
-	*((float*)dest) = f;
-	command_response(iFace, 0);
-}
-
-static void param_ptr_u8_pulseChar(uint8_t iFace, float f, void *dest)
-{
-	gammaPulseChar = (uint8_t)f;
-	coreParams.sys_pulseChar = gammaPulseChar;
-	command_response(iFace, 0);
-}
-
-static void param_ptr_float_hv(uint8_t iFace, float f, void *dest)
-{
-	*((float*)dest) = f;
-	if (daq_enabled) update_hv_temp();
-	command_response(iFace, 0);
-}
-
 
 static void pomelo_dosimetry(float *cpm, float *uSvph, float *seconds)
 {
@@ -1502,8 +1697,8 @@ static void pomelo_dosimetry(float *cpm, float *uSvph, float *seconds)
 	float eAdc0, eAdc1, eAdc2;
 	
 	cpu_irq_disable();
-	l_gammaTime = gammaTime + tc_get_count_value(&tc_instance_app);
-	tc_set_count_value(&tc_instance_app, 0);
+	timer_updateValues_unsafe();
+	l_gammaTime = gammaTime;
 	l_gammaCounts = gammaCounts;
 	l_gammaSum = gammaSum;
 	l_gammaSumSquare = gammaSumSquare;
@@ -1541,46 +1736,175 @@ static void pomelo_dosimetry(float *cpm, float *uSvph, float *seconds)
 }
 
 
+
+static void param_set(uint8_t iFace, uint8_t *buf)
+{
+	int32_t parameter;
+	float setting;
+	char *separatorPtr, *endPtr;
+	
+	parameter = strtol(buf, &separatorPtr, 10);
+	if (buf == separatorPtr)
+	{
+		// Malformed input. No parameter given
+		command_response(iFace, -2);
+		return;
+	}
+	
+	if (separatorPtr[0] != ':')
+	{
+		// Malformed input
+		command_response(iFace, -2);
+		return;
+	}
+
+	if (separatorPtr[1] == 0)
+	{
+		// Malformed input -- missing value
+		command_response(iFace, -2);
+		return;
+	}
+
+	setting = strtof(&separatorPtr[1], &endPtr);
+	
+	if (*endPtr != 0)
+	{
+		// Malformed input -- extra stuff at the end
+		command_response(iFace, -2);
+		return;
+	}
+
+	// Ok, place setting in parameter.
+	switch(parameter)
+	{
+		case 0:
+			// SiPM vmin
+			if (setting < 0 || setting > 4096) { command_response(iFace, -1); return; }
+			physicsParams.sipm_vMin = setting;
+			if (daq_enabled) update_hv_temp(false);
+			break;
+		case 1:
+			if (setting < 0 || setting > 4096) { command_response(iFace, -1); return; }
+			physicsParams.sipm_vMax = setting;
+			if (daq_enabled) update_hv_temp(false);
+			break;
+		case 2:
+			if (setting < 0 || setting > 4096) { command_response(iFace, -1); return; }
+			physicsParams.sipm_v0deg = setting;
+			if (daq_enabled) update_hv_temp(false);
+			break;
+		case 3:
+			if (setting < -5 || setting > 5) { command_response(iFace, -1); return; }
+			physicsParams.sipm_vTempComp = setting;
+			if (daq_enabled) update_hv_temp(false);
+			break;
+		case 4:
+			physicsParams.ecal[0] = setting;
+			break;
+		case 5:
+			physicsParams.ecal[1] = setting;
+			break;
+		case 6:
+			physicsParams.ecal[2] = setting;
+			break;
+		case 7:
+			physicsParams.uSvph_constant = setting;
+			break;
+		case 8:
+			coreParams.vDac[0] = setting;
+			if (daq_enabled) update_hv_temp(false);
+			break;
+		case 9:
+			coreParams.vDac[1] = setting;
+			if (daq_enabled) update_hv_temp(false);
+			break;
+		case 10:
+			coreParams.iMeas[0] = setting;
+			break;
+		case 11:
+			coreParams.iMeas[1] = setting;
+			break;
+		case 12:
+			coreParams.iMeas[2] = setting;
+			break;
+		case 13:
+			if (setting < 1 || setting > 4096) { command_response(iFace, -1); return; }
+			coreParams.threshold = setting;
+			dac_chan_write(&dac_instance_app, DAC_CHANNEL_1, coreParams.threshold);
+			break;
+		case 14:
+			if (setting < 0 || setting > 127) { command_response(iFace, -1); return; }
+			gammaFifoHead = 1;
+			gammaFifoTail = 0;
+			listOut = (int16_t)setting;
+			coreParams.sys_outputs = listOut;
+			break;
+		case 15:
+			if (setting < 0 || setting > 1) { command_response(iFace, -1); return; }
+			if ((int16_t)setting == 0)
+			{
+				coincidences_reset();
+				gammaCoincidence = false;
+			}
+			else
+			{
+				gammaCoincidence = true;
+				coincidences_enable();
+			}
+			coreParams.sys_coincidence = gammaCoincidence;
+			break;
+		case 16:
+			if (setting < 128 || setting > 255) { command_response(iFace, -1); return; }
+			gammaPulseChar = (uint8_t)setting;
+			coreParams.sys_pulseChar = gammaPulseChar;
+			break;
+		case 100:
+			if ((int16_t)setting != -2024) { command_response(iFace, -1); return; }
+			command_response(iFace, save_parameters());
+			return;
+			break;
+		case 200:
+			if ((int16_t)setting != -2024) { command_response(iFace, -1); return; }
+			pomelo_off();
+			adc_calib(iFace);
+			break;
+		case 300:
+			if ((int16_t)setting != -2024) { command_response(iFace, -1); return; }
+			init_physics();
+			break;
+		case 1000:
+			if ((int16_t)setting != -2024) { command_response(iFace, -1); return; }
+			pomelo_off();
+			NVIC_SystemReset();
+			break;
+		case 2000:
+			if ((int16_t)setting != -2024) { command_response(iFace, -1); return; }
+			pomelo_off();
+			reset_to_bootloader();
+			break;
+		default:
+			command_response(iFace, -2);
+			return;
+	}
+
+
+	command_response(iFace, 0);
+}
+
+
+
 static void command_data_handler(uint8_t iFace, uint8_t rxChar)
 {
 	static int16_t count = 0;
 	static uint32_t i;
-	static float temp;
+	static float temp, cpm, usvph;
 	static uint8_t paramBuf[64];
-	static char *paramEnd;
-	static void (*paramFunc)(uint8_t, float, void*);
-	static void *paramPtr;
-	static float paramMin, paramMax;
 
 	switch (cmdState)
 	{
 		case STATE_CMD_IDLE:
 			switch (rxChar)
 			{
-				case 'b':
-					// Special paramType telling command state to go to bootloader
-					paramFunc = &param_bootloader;
-					paramMin = -1e6;
-					paramMax = 1e6;
-					cmdState = STATE_CMD_PARAM;
-					count = 0;
-					break;
-				case 'a':
-					// Special paramType telling command state to go to adc calib
-					paramFunc = &param_adc_calib;
-					paramMin = -1e6;
-					paramMax = 1e6;
-					cmdState = STATE_CMD_PARAM;
-					count = 0;
-					break;
-				case 'e':
-					// Special paramType telling command state to reboot
-					paramFunc = &param_reboot;
-					paramMin = -1e6;
-					paramMax = 1e6;
-					cmdState = STATE_CMD_PARAM;
-					count = 0;
-					break;
 				case 'h':
 					// Histogram
 					pomelo_printf(iFace, "{\"type\":\"spectrum\", \"payload\":{");
@@ -1635,7 +1959,7 @@ static void command_data_handler(uint8_t iFace, uint8_t rxChar)
 					pomelo_sprintf(iFace, "\"vMax\":%f,", physicsParams.sipm_vMax);
 					pomelo_sprintf(iFace, "\"v0deg\":%f,", physicsParams.sipm_v0deg);
 					pomelo_sprintf(iFace, "\"vTempComp\":%f},", physicsParams.sipm_vTempComp);
-					pomelo_sprintf(iFace, "\"vdac\":[%f,%f],", coreParams.vdac[0], coreParams.vdac[1]);
+					pomelo_sprintf(iFace, "\"vdac\":[%f,%f],", coreParams.vDac[0], coreParams.vDac[1]);
 					pomelo_sprintf(iFace, "\"ecal\":[%8e,%8e,%8e],", physicsParams.ecal[0], physicsParams.ecal[1], physicsParams.ecal[2]);
 					pomelo_sprintf(iFace, "\"threshold\":%d,", coreParams.threshold);
 					pomelo_sprintf(iFace, "\"coincidence\":%d,", coreParams.sys_coincidence);
@@ -1663,190 +1987,68 @@ static void command_data_handler(uint8_t iFace, uint8_t rxChar)
 					// Print pomeloParams structure
 					// To be removed once a tool is available for setting parameters
 					pomelo_printf(iFace, "\npomeloParams = {\n");
-					pomelo_sprintf(iFace, "\t[1] sipm_vMin = %f,\n", physicsParams.sipm_vMin);
-					pomelo_sprintf(iFace, "\t[2] sipm_vMax = %f,\n", physicsParams.sipm_vMax);
-					pomelo_sprintf(iFace, "\t[3] sipm_v0deg = %f,\n", physicsParams.sipm_v0deg);
-					pomelo_sprintf(iFace, "\t[4] sipm_vTempComp = %f,\n", physicsParams.sipm_vTempComp);
-					pomelo_sprintf(iFace, "\t[5-6] vdac[2] = {%f, %f},\n", coreParams.vdac[0], coreParams.vdac[1]);
-					pomelo_sprintf(iFace, "\t[7-9] ecal[3] = {%f, %f, %f},\n", physicsParams.ecal[0], physicsParams.ecal[1], physicsParams.ecal[2]);
-					pomelo_sprintf(iFace, "\t[_] uSvph_constant = %f,\n", physicsParams.uSvph_constant);
-					pomelo_sprintf(iFace, "\t[t] threshold = %d,\n", coreParams.threshold);
-					pomelo_sprintf(iFace, "\t[o] sys_outputs = %d,\n", coreParams.sys_outputs);
+					pomelo_sprintf(iFace, "\t[0] sipm_vMin = %f,\n", physicsParams.sipm_vMin);
+					pomelo_sprintf(iFace, "\t[1] sipm_vMax = %f,\n", physicsParams.sipm_vMax);
+					pomelo_sprintf(iFace, "\t[2] sipm_v0deg = %f,\n", physicsParams.sipm_v0deg);
+					pomelo_sprintf(iFace, "\t[3] sipm_vTempComp = %f,\n", physicsParams.sipm_vTempComp);
+					pomelo_sprintf(iFace, "\t[4-6] ecal[3] = {%f, %f, %f},\n", physicsParams.ecal[0], physicsParams.ecal[1], physicsParams.ecal[2]);
+					pomelo_sprintf(iFace, "\t[7] uSvph_constant = %f,\n\n", physicsParams.uSvph_constant);
+					pomelo_sprintf(iFace, "\t[8-9] vDac[2] = {%f, %f},\n", coreParams.vDac[0], coreParams.vDac[1]);
+					pomelo_sprintf(iFace, "\t[10-12] iMeas[3] = {%f, %f, %f},\n", coreParams.iMeas[0], coreParams.iMeas[1], coreParams.iMeas[2]);
+					pomelo_sprintf(iFace, "\t[13] threshold = %d,\n", coreParams.threshold);
+					pomelo_sprintf(iFace, "\t[14] sys_outputs = %d,\n", coreParams.sys_outputs);
+					pomelo_sprintf(iFace, "\t[15] sys_coincidence = %d,\n", coreParams.sys_coincidence);
+					pomelo_sprintf(iFace, "\t[16] sys_pulseChar = %d,\n", coreParams.sys_pulseChar);
 					pomelo_sprintf(iFace, "\t[x/z] sys_power = %d,\n", coreParams.sys_power);
-					pomelo_sprintf(iFace, "\t[p] sys_coincidence = %d,\n", coreParams.sys_coincidence);
-					pomelo_sprintf(iFace, "\t[l] sys_pulseChar = %d,\n", coreParams.sys_pulseChar);
 					pomelo_sprintf(iFace, "\tdetString = %s,\n", physicsParams.detString);
 					pomelo_sprintf(iFace, "\ttempType = %d,\n", physicsParams.tempType);
-					pomelo_sprintf(iFace, "\tcoreInitialized = %d,\n", coreParams.initialized);
-					pomelo_sprintf(iFace, "\tphysicsInitialized = %d,\n", physicsParams.initialized);
+					pomelo_sprintf(iFace, "\tcoreVersion = %d,\n", coreParams.version);
+					pomelo_sprintf(iFace, "\tphysicsVersion = %d,\n", physicsParams.version);
 					pomelo_printf(iFace, "\n};\n");
-					break;
-				case 'w':
-					paramFunc = &param_write_nvm;
-					paramMin = -1e6;
-					paramMax = 1e6;
-					cmdState = STATE_CMD_PARAM;
-					count = 0;
 					break;
 				case 'r':
 					load_parameters();
 					command_response(iFace, 0);
 					break;
-				case 'd':
-					command_response(iFace, clear_parameters());
+				case 'k':
+					//upgradePhysics();
 					break;
-				case 'i':
-					//init_physics();
-					//strcpy(physicsParams.detString, "CapeScint LaBr-14x25c-SiPM-T");
-					//strcpy(physicsParams.detString, "3\" Adapter, Broadcom 8x8mm2 SiPM");
-					strcpy(physicsParams.detString, "CsI(Tl) 2cm3, Broadcom 4x4mm2 SiPM");
-					physicsParams.initialized = 0x55;
-					physicsParams.tempType = 1;
-					physicsParams.uSvph_constant = 2.09534976;
-					physicsParams.sipm_vTempComp = 0.03593;
+				case 'f':
+					//upgradeCore();
 					break;
 				case 'g':
 					// CPM
-					pomelo_dosimetry(&paramMin, &paramMax, &temp);
-					//pomelo_sprintf(iFace, "{\"type\":\"dosimetry\",\"payload\":{\"cpm\":%f}}\n", paramMin);
-					pomelo_sprintf(iFace, "%f\n", paramMin);
+					pomelo_dosimetry(&cpm, &usvph, &temp);
+					pomelo_sprintf(iFace, "%f\n", cpm);
 					break;
 				case 'u':
 					// uSv/h
-					pomelo_dosimetry(&paramMin, &paramMax, &temp);
-					//pomelo_sprintf(iFace, "{\"type\":\"dosimetry\",\"payload\":{\"uSv/h\":%f}}\n", paramMax);
-					pomelo_sprintf(iFace, "%f\n", paramMax);
+					pomelo_dosimetry(&cpm, &usvph, &temp);
+					pomelo_sprintf(iFace, "%f\n", usvph);
 					break;
 				case 'm':
 					// Measure both CPM and uSv/h
-					pomelo_dosimetry(&paramMin, &paramMax, &temp);
-					pomelo_sprintf(iFace, "{\"type\":\"dosimetry\",\"payload\":{\"cpm\":%f,", paramMin);
-					pomelo_sprintf(iFace, "\"uSv/h\":%f,\"time\":%f}}\n", paramMax, temp);
+					pomelo_dosimetry(&cpm, &usvph, &temp);
+					pomelo_sprintf(iFace, "{\"type\":\"dosimetry\",\"payload\":{\"cpm\":%f,", cpm);
+					pomelo_sprintf(iFace, "\"uSv/h\":%f,\"time\":%f}}\n", usvph, temp);
 					break;
-				case 't':
-					// Set threshold via parameter
-					paramFunc = &param_threshold;
-					paramMin = 1;
-					paramMax = 4095;
-					cmdState = STATE_CMD_PARAM;
-					count = 0;					
-					break;
-				case 'o':
-					// Set outputs via parameter
-					paramFunc = &param_list_out;
-					paramMin = 0;
-					paramMax = 127;
-					cmdState = STATE_CMD_PARAM;
-					count = 0;					
-					break;
-				case 'l':
-					// Set gamma pulse char
-					paramFunc = &param_ptr_u8_pulseChar;
-					paramMin = 128;
-					paramMax = 255;
-					cmdState = STATE_CMD_PARAM;
-					count = 0;					
+				case 'i':
+					// Read sipm current
+					pomelo_sprintf(iFace, "{\"type\":\"current\",\"payload\":{\"uA\":%f,", hvload_uA());
+					pomelo_sprintf(iFace, "\"tOff\":%d,\"boost\":%d}}\n", hvloadOff, hvBoost);
 					break;
 				case 'p':
-					// Set coincidence mode via parameter
-					paramFunc = &param_coincidence;
-					paramMin = 0;
-					paramMax = 1;
+					// Pomelo parametrized procedure
 					cmdState = STATE_CMD_PARAM;
 					count = 0;
 					break;
-				case '1':
-					// Set sipm_vMin via parameter
-					paramFunc = &param_ptr_float_hv;
-					paramMin = 0.0;
-					paramMax = 4095.0;
-					paramPtr = &physicsParams.sipm_vMin;
-					cmdState = STATE_CMD_PARAM;
-					count = 0;					
-					break;
-				case '2':
-					// Set sipm_vMax via parameter
-					paramFunc = &param_ptr_float_hv;
-					paramMin = 0.0;
-					paramMax = 4095.0;
-					paramPtr = &physicsParams.sipm_vMax;
-					cmdState = STATE_CMD_PARAM;
-					count = 0;					
-					break;
-				case '3':
-					// Set sipm_v0deg via parameter
-					paramFunc = &param_ptr_float_hv;
-					paramMin = 1;
-					paramMax = 4095;
-					paramPtr = &physicsParams.sipm_v0deg;
-					cmdState = STATE_CMD_PARAM;
-					count = 0;					
-					break;
-				case '4':
-					// Set sipm_vTempComp via parameter
-					paramFunc = &param_ptr_float_hv;
-					paramMin = -50000;
-					paramMax = 50000;
-					paramPtr = &physicsParams.sipm_vTempComp;
-					cmdState = STATE_CMD_PARAM;
-					count = 0;					
-					break;
-				case '5':
-					// Set vdac[0] via parameter
-					paramFunc = &param_ptr_float_hv;
-					paramMin = -50000;
-					paramMax = 50000;
-					paramPtr = &coreParams.vdac[0];
-					cmdState = STATE_CMD_PARAM;
-					count = 0;					
-					break;
-				case '6':
-					// Set vdac[1] via parameter
-					paramFunc = &param_ptr_float_hv;
-					paramMin = -50000;
-					paramMax = 50000;
-					paramPtr = &coreParams.vdac[1];
-					cmdState = STATE_CMD_PARAM;
-					count = 0;					
-					break;
-				case '7':
-					// Set ecal[0] via parameter
-					paramFunc = &param_ptr_float;
-					paramMin = -1e6;
-					paramMax = 1e6;
-					paramPtr = &physicsParams.ecal[0];
-					cmdState = STATE_CMD_PARAM;
-					count = 0;					
-					break;
-				case '8':
-					// Set ecal[1] via parameter
-					paramFunc = &param_ptr_float;
-					paramMin = -1e6;
-					paramMax = 1e6;
-					paramPtr = &physicsParams.ecal[1];
-					cmdState = STATE_CMD_PARAM;
-					count = 0;					
-					break;
-				case '9':
-					// Set ecal[2] via parameter
-					paramFunc = &param_ptr_float;
-					paramMin = -1e6;
-					paramMax = 1e6;
-					paramPtr = &physicsParams.ecal[2];
-					cmdState = STATE_CMD_PARAM;
-					count = 0;					
-					break;
 				case '/':
 					// Boost SiPM power
-					hv_disable();
-					hv_boost(true);
-					hv_enable();
+					//hv_changeBoost(true);
 					break;
 				case '*':
 					// Disable SiPM power boost
-					hv_disable();
-					hv_boost(false);
-					hv_enable();
+					//hv_changeBoost(false);
 					break;
 				default:
 					//command_response(iFace, -128);
@@ -1858,21 +2060,7 @@ static void command_data_handler(uint8_t iFace, uint8_t rxChar)
 			{
 				// Done, parse it
 				paramBuf[count] = 0;
-
-				//temp = atof(paramBuf);
-				temp = strtof(paramBuf, &paramEnd);
-				if (*paramEnd != 0)
-				{
-					command_response(iFace, -2);
-				}
-				else if ((temp < paramMin) || (temp > paramMax))
-				{
-					command_response(iFace, -1);
-				}
-				else
-				{
-					paramFunc(iFace, temp, paramPtr);
-				}
+				param_set(iFace, paramBuf);
 				cmdState = STATE_CMD_IDLE;
 			}
 			else if (count == (sizeof(paramBuf) - 1))
@@ -1955,6 +2143,11 @@ static void apply_parameters(void)
 	// and apply to hardware
 	dac_chan_write(&dac_instance_app, DAC_CHANNEL_1, coreParams.threshold);
 	
+	if (coreParams.sys_coincidence)
+	{
+		coincidences_enable();
+	}
+	
 	if (coreParams.sys_power)
 	{
 		pomelo_on();
@@ -2019,40 +2212,27 @@ int main(void)
 	pin_conf.direction  = PORT_PIN_DIR_INPUT;
 	port_pin_set_config(PIN_PA18, &pin_conf);
 
+	// Synchronizer input
+	pin_conf.direction  = PORT_PIN_DIR_INPUT;
+	port_pin_set_config(PIN_PB08, &pin_conf);
+
 	// PeakDet EN input (2nd trigger)
 	pin_conf.direction  = PORT_PIN_DIR_INPUT;
 	port_pin_set_config(PIN_PB03, &pin_conf);
-
-
-	// Coincidences monitor line
-	pin_conf.direction  = PORT_PIN_DIR_INPUT;
-	pin_conf.input_pull = PORT_PIN_PULL_DOWN;
-	port_pin_set_config(PIN_PA20, &pin_conf);
-
-	// Coincidences ACK output
-	pin_conf.direction  = PORT_PIN_DIR_OUTPUT;
-	port_pin_set_config(PIN_PB11, &pin_conf);
-	port_pin_set_output_level(PIN_PB11, 0);
-
-
-	// Coincidences synchronizer output
-	pin_conf.direction  = PORT_PIN_DIR_OUTPUT;
-	port_pin_set_config(PIN_PB09, &pin_conf);
-	port_pin_set_output_level(PIN_PB09, 0);
-	
-	// Coincidences synchronizer input
-	pin_conf.direction  = PORT_PIN_DIR_INPUT;
-	pin_conf.input_pull = PORT_PIN_PULL_DOWN;
-	port_pin_set_config(PIN_PB08, &pin_conf);
 
 	// HV crowbar. Active low, to engage it when board power is switched off
 	pin_conf.direction  = PORT_PIN_DIR_OUTPUT;
 	port_pin_set_config(PIN_PA21, &pin_conf);
 	port_pin_set_output_level(PIN_PA21, 1);
 	
+	// HV load measurement
+	pin_conf.direction  = PORT_PIN_DIR_INPUT;
+	pin_conf.input_pull = PORT_PIN_PULL_NONE;
+	port_pin_set_config(PIN_PB10, &pin_conf);
 
 
 	// Paranoid, just make sure HV PWM starts off
+	hvBoost = false;
 	hv_disable();
 
 	// Clear peak detector capacitor
@@ -2084,6 +2264,8 @@ int main(void)
 	gammaSyncTrig = false;
 	listOut = 0;
 
+	hvloadTime = 0;
+
 	// Start with USB enabled. Will be switched off by main loop if required
 	usb_connected = true;
 	main_clock_select_dfll();
@@ -2091,7 +2273,7 @@ int main(void)
 
 	uart_init();
 	adc_init_gamma();
-	ccl_init_coincidences();
+	coincidences_reset();
 	timer_init_gamma();
 
 	// Do this to have a consistent state
@@ -2165,15 +2347,15 @@ int main(void)
 		
 		if (temp_comp_run)
 		{
-			if (daq_enabled) update_hv_temp();
+			if (daq_enabled) update_hv_temp(false);
 			temp_comp_run = false;
 		}
 		
 		if (gammaSyncTrig)
 		{
-			port_pin_set_output_level(PIN_PB09, 1);
+			port_pin_set_output_level(PIN_PB02, 1);
 			nop(); nop(); nop(); nop(); nop(); // 5us. Aaaactually almost nothing
-			port_pin_set_output_level(PIN_PB09, 0);
+			port_pin_set_output_level(PIN_PB02, 0);
 			gammaSyncTrig = false;
 		}
 		

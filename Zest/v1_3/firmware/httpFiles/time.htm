@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Pomelo Set Time</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+</head>
+<body>
+  <h1>Pomelo Set Time</h1>
+    <form action="/time.htm" method="POST">
+      <p>
+        <label for="year">Y:</label>
+        <input type="number" id="year" name="year" min="2024" max="3000">
+        <label for="month">Mo:</label>
+        <input type="number" id="month" name="month" min="1" max="12">
+        <label for="day">D:</label>
+        <input type="number" id="day" name="day" min="1" max="31">
+        <br>
+        <label for="hour">H:</label>
+        <input type="number" id="hour" name="hour" min="0" max="23">
+        <label for="minute">Mi:</label>
+        <input type="number" id="minute" name="minute" min="0" max="59">
+        <input type ="submit" value ="Submit">
+      </p>
+    </form>
+<br><br>
+<a href="/">Back</a> 
+</body>
+</html>
